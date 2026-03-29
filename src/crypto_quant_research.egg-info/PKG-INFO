@@ -1,0 +1,100 @@
+Metadata-Version: 2.4
+Name: crypto-quant-research
+Version: 0.1.0
+Summary: Research-first crypto quantitative trading project with backtesting and paper trading.
+Author: OpenAI Codex
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest<9.0,>=8.0; extra == "dev"
+
+# Crypto Quant Research
+
+這是一個以研究、回測、paper trading 為核心的 Python 加密貨幣量化交易專案。它刻意不做真實下單，所有交易所互動都透過 stub / mock，方便先把策略、風控與回測流程打穩，再往 Binance / Bybit 擴充。
+
+## 目標
+
+- 只做 research + backtest + paper trading
+- 不放任何真實 API key
+- 不直接接 live trading
+- 採用 `src layout`
+- 以 Python 3.11 為目標執行環境
+- 使用 `pytest`
+
+## 專案結構
+
+```text
+src/
+  adapters/
+    base.py
+    binance_stub.py
+  data/
+    backfill.py
+  execution/
+    paper_broker.py
+  monitoring/
+    logging_utils.py
+  research/
+    backtest.py
+  risk/
+    limits.py
+  strategies/
+    base.py
+    trend_breakout.py
+tests/
+```
+
+## 交易計畫
+
+專案內建的 `TrendBreakoutStrategy` 會把你前面定義的結構交易計畫做成規則：
+
+1. 先判斷近端是否有暴漲 / 暴跌的脈衝行情
+2. 再用 pivot highs / lows 擬合上升通道或下降通道
+3. 上升通道靠近下緣支撐做多，或突破上緣做多
+4. 下降通道靠近上緣壓力做空，或跌破下緣做空
+5. 多單止損放在支撐下方，空單止損放在壓力上方
+6. 目標價使用通道高度投射，或先看對側邊界
+
+## 安裝
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .[dev]
+```
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e .[dev]
+```
+
+## 執行回測
+
+```bash
+python -m research.backtest --symbol BTCUSDT --timeframe 1h --limit 180
+```
+
+先把 stub 資料 backfill 到 CSV：
+
+```bash
+python -m data.backfill --symbol BTCUSDT --timeframe 1h --limit 180 --output data/sample_bars.csv
+python -m research.backtest --csv data/sample_bars.csv --symbol BTCUSDT --timeframe 1h
+```
+
+## 執行測試
+
+```bash
+pytest
+```
+
+## 重要限制
+
+- 所有交易所互動目前都走 stub，沒有 live trading
+- `.env.example` 只放佔位欄位，不含任何真實金鑰
+- `PaperBroker` 只模擬下單、持倉、手續費、滑點
+- 若之後要接 Binance / Bybit，優先擴充 `src/adapters/base.py` 的介面，而不是在策略裡直接寫交易所邏輯
