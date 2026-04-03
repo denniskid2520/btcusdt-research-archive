@@ -17,6 +17,23 @@ def backfill_to_csv(
     output_path: str | Path,
 ) -> Path:
     bars = adapter.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+    return _write_bars_csv(bars, output_path)
+
+
+def backfill_range_to_csv(
+    adapter,
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+    output_path: str | Path,
+) -> Path:
+    """Download a date range via adapter.fetch_range() and save to CSV."""
+    bars = adapter.fetch_range(symbol=symbol, timeframe=timeframe, start=start, end=end)
+    return _write_bars_csv(bars, output_path)
+
+
+def _write_bars_csv(bars: list[MarketBar], output_path: str | Path) -> Path:
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", encoding="utf-8", newline="") as handle:
@@ -58,21 +75,51 @@ def load_bars_from_csv(path: str | Path) -> list[MarketBar]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backfill stub market data to CSV.")
+    parser = argparse.ArgumentParser(description="Backfill market data to CSV.")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--timeframe", default="1h")
     parser.add_argument("--limit", type=int, default=180)
     parser.add_argument("--output", default="data/sample_bars.csv")
+    parser.add_argument("--live", action="store_true", help="Use real Binance API instead of stub")
+    parser.add_argument("--start", type=str, default=None, help="Start date YYYY-MM-DD (requires --live)")
+    parser.add_argument("--end", type=str, default=None, help="End date YYYY-MM-DD (requires --live)")
     args = parser.parse_args()
 
-    output = backfill_to_csv(
-        adapter=BinanceStubAdapter(),
-        symbol=args.symbol,
-        timeframe=args.timeframe,
-        limit=args.limit,
-        output_path=args.output,
-    )
-    print(f"Wrote {args.limit} bars to {output}")
+    if args.live:
+        from adapters.binance_live import BinanceLiveAdapter
+
+        adapter = BinanceLiveAdapter()
+        if args.start and args.end:
+            start_dt = datetime.strptime(args.start, "%Y-%m-%d")
+            end_dt = datetime.strptime(args.end, "%Y-%m-%d")
+            output = backfill_range_to_csv(
+                adapter=adapter,
+                symbol=args.symbol,
+                timeframe=args.timeframe,
+                start=start_dt,
+                end=end_dt,
+                output_path=args.output,
+            )
+            bars = load_bars_from_csv(output)
+            print(f"Wrote {len(bars)} bars to {output}")
+        else:
+            output = backfill_to_csv(
+                adapter=adapter,
+                symbol=args.symbol,
+                timeframe=args.timeframe,
+                limit=args.limit,
+                output_path=args.output,
+            )
+            print(f"Wrote {args.limit} bars to {output}")
+    else:
+        output = backfill_to_csv(
+            adapter=BinanceStubAdapter(),
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            limit=args.limit,
+            output_path=args.output,
+        )
+        print(f"Wrote {args.limit} bars to {output}")
 
 
 if __name__ == "__main__":

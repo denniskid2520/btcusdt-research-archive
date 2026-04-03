@@ -2,13 +2,13 @@
   "report_type": "current_live_setup_report",
   "case_id": "Case10",
   "evaluation_date": "2026-04-03",
-  "current_price": 67500.0,
+  "current_price": 66776.5,
   "parent_structure_summary": {
     "parent_f": {
       "name": "Parent_F",
       "type": "bearish_impulse_then_ascending_rebound_channel",
       "period": "2025-11-21 -> 2026-01-29",
-      "transition": "downside breakdown 2026-01-29, selloff to 60000"
+      "transition": "2026-01-29 downside breakdown followed by selloff into 2026-02-06 low near 60000."
     },
     "parent_g": {
       "name": "Parent_G",
@@ -17,42 +17,37 @@
       "key_highs": [
         {
           "date": "2026-02-09",
-          "price": 71453
+          "price": 71453.0
         },
         {
           "date": "2026-03-04",
-          "price": 74050
+          "price": 74050.0
         },
         {
           "date": "2026-03-17",
-          "price": 76000
+          "price": 76000.0
         }
       ],
       "key_lows": [
         {
           "date": "2026-02-06",
-          "price": 60000,
-          "label": ""
+          "price": 60000.0
         },
         {
           "date": "2026-02-25",
-          "price": 63913,
-          "label": ""
+          "price": 63913.0
         },
         {
           "date": "2026-03-08",
-          "price": 65618,
-          "label": ""
+          "price": 65618.0
         },
         {
           "date": "2026-03-23",
-          "price": 67445,
-          "label": ""
+          "price": 67445.0
         },
         {
           "date": "2026-03-29",
-          "price": 65000,
-          "label": "breakdown_below_lower_bound"
+          "price": 65000.0
         }
       ],
       "midline_retest": "2026-03-25 at 72026"
@@ -99,7 +94,7 @@
     {
       "name": "retest_failure_confirmed",
       "passed": true,
-      "detail": "CONFIRMED: price=67500 < retest=69310 and < lower_bound=67535"
+      "detail": "CONFIRMED: price=66776 < retest=69310 and < lower_bound=67535"
     }
   ],
   "all_conditions_met": true,
