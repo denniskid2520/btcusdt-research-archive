@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find . -type d ! -path */__pycache__/* ! -path */.git/*)",
+      "Bash(python -m pytest -v)",
+      "Bash(python -m context.watch_mode --price 67500 --date 2026-04-03)",
+      "Bash(python -m context.watch_mode --price 69500 --date 2026-04-03 --output data/reports/example_not_valid.json)",
+      "Bash(python -m context.generate_reports)"
+    ]
+  }
+}
