@@ -6,20 +6,41 @@ No order placement.  No strategy rule changes.  This module only:
 3. Saves the report to disk
 
 Usage:
-    python -m context.watch_mode --price 67500
+    python -m context.watch_mode --live              # auto-fetch from Binance
+    python -m context.watch_mode --price 67500       # manual price
     python -m context.watch_mode --price 67500 --date 2026-04-03
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
 from context.live_setup_validator import save_report, validate_case10_live_setup
 
 
-DEFAULT_REPORT_PATH = "data/reports/current_live_setup_report.json"  # shared with Codex reports
+DEFAULT_REPORT_PATH = "data/reports/current_live_setup_report.json"
+
+
+def _fetch_live_price() -> float:
+    """Fetch current BTCUSDT price from Binance public API (no auth needed)."""
+    import sys
+    from pathlib import Path
+
+    # quant_trading lives at project root, one level above src/
+    project_root = str(Path(__file__).resolve().parent.parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from quant_trading.binance import BinanceClient
+    from quant_trading.config import BinanceConfig
+
+    client = BinanceClient(BinanceConfig(use_testnet=False))
+    price = client.get_ticker_price("BTCUSDT")
+    print(f"  [live] Fetched BTCUSDT price from Binance: {price:.2f}")
+    return price
 
 
 def _print_status(report: dict) -> None:
@@ -91,10 +112,15 @@ def _print_status(report: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Watch mode for Case10 live setup")
     parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Auto-fetch current BTCUSDT price from Binance (public API, no key needed)",
+    )
+    parser.add_argument(
         "--price",
         type=float,
         default=None,
-        help="Current BTCUSDT price (if omitted, report will flag missing price)",
+        help="Manual BTCUSDT price (ignored if --live is used)",
     )
     parser.add_argument(
         "--date",
@@ -110,12 +136,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Resolve price
+    current_price = args.price
+    if args.live:
+        try:
+            current_price = _fetch_live_price()
+        except Exception as e:
+            print(f"  [error] Failed to fetch live price: {e}", file=sys.stderr)
+            if current_price is None:
+                print("  [error] No --price fallback provided. Exiting.", file=sys.stderr)
+                sys.exit(1)
+            print(f"  [fallback] Using manual price: {current_price}")
+
     eval_date: date | None = None
     if args.date:
         eval_date = datetime.strptime(args.date, "%Y-%m-%d").date()
 
     report = validate_case10_live_setup(
-        current_price=args.price,
+        current_price=current_price,
         current_date=eval_date,
     )
 
