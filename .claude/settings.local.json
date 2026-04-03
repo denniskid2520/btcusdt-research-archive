@@ -5,7 +5,8 @@
       "Bash(python -m pytest -v)",
       "Bash(python -m context.watch_mode --price 67500 --date 2026-04-03)",
       "Bash(python -m context.watch_mode --price 69500 --date 2026-04-03 --output data/reports/example_not_valid.json)",
-      "Bash(python -m context.generate_reports)"
+      "Bash(python -m context.generate_reports)",
+      "Bash(GIT_AUTHOR_NAME=\"User\" GIT_AUTHOR_EMAIL=\"user@users.noreply.github.com\" GIT_COMMITTER_NAME=\"User\" GIT_COMMITTER_EMAIL=\"user@users.noreply.github.com\" git commit -m \"$\\(cat <<''EOF'':*)"
     ]
   }
 }
