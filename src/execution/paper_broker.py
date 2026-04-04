@@ -21,11 +21,13 @@ class PaperBroker(BrokerAdapter):
         fee_rate: float = 0.001,
         slippage_rate: float = 0.0005,
         fill_ratio: float = 1.0,
+        leverage: int = 1,
     ) -> None:
         self._cash = initial_cash
         self.fee_rate = fee_rate
         self.slippage_rate = slippage_rate
         self.fill_ratio = fill_ratio
+        self.leverage = max(leverage, 1)
         self._positions: dict[str, PaperPosition] = {}
         self._order_ids = count(1)
 
@@ -46,35 +48,36 @@ class PaperBroker(BrokerAdapter):
             return None
 
         notional = fill_price * filled_quantity
+        margin = notional / self.leverage
         fee = notional * self.fee_rate
         if order.side in {"buy", "short"} and position.is_open:
             raise ValueError("PaperBroker supports one open position per symbol.")
 
         if order.side == "buy":
-            if notional + fee > self._cash:
+            if margin + fee > self._cash:
                 return None
-            self._cash -= notional + fee
+            self._cash -= margin + fee
             self._positions[order.symbol] = PaperPosition(
                 symbol=order.symbol,
                 side="long",
                 quantity=filled_quantity,
                 average_price=fill_price,
-                reserved_margin=notional,
+                reserved_margin=margin,
                 stop_price=order.metadata.get("stop_price"),
                 target_price=order.metadata.get("target_price"),
                 second_target_price=order.metadata.get("second_target_price"),
                 entry_reason=order.metadata.get("reason", ""),
             )
         elif order.side == "short":
-            if notional + fee > self._cash:
+            if margin + fee > self._cash:
                 return None
-            self._cash -= notional + fee
+            self._cash -= margin + fee
             self._positions[order.symbol] = PaperPosition(
                 symbol=order.symbol,
                 side="short",
                 quantity=filled_quantity,
                 average_price=fill_price,
-                reserved_margin=notional,
+                reserved_margin=margin,
                 stop_price=order.metadata.get("stop_price"),
                 target_price=order.metadata.get("target_price"),
                 second_target_price=order.metadata.get("second_target_price"),
@@ -133,6 +136,22 @@ class PaperBroker(BrokerAdapter):
             else (position.average_price - market_price) * position.quantity
         )
         return self._cash + position.reserved_margin + unrealized
+
+    def check_liquidation(self, symbol: str, market_price: float, timestamp: datetime) -> bool:
+        """Check if position should be liquidated (unrealized loss >= margin)."""
+        position = self._positions.get(symbol)
+        if position is None or not position.is_open:
+            return False
+        unrealized = (
+            (market_price - position.average_price) * position.quantity
+            if position.side == "long"
+            else (position.average_price - market_price) * position.quantity
+        )
+        if unrealized <= -position.reserved_margin:
+            # Liquidation: margin is lost entirely
+            self._positions.pop(symbol, None)
+            return True
+        return False
 
     def _apply_slippage(self, market_price: float, side: str) -> float:
         if side in {"buy", "cover"}:

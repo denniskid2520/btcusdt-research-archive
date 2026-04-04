@@ -112,6 +112,26 @@ def run_backtest(
         position = broker.get_position(symbol)
         order: OrderRequest | None = None
 
+        # Liquidation check (leverage)
+        if position.is_open and hasattr(broker, "check_liquidation"):
+            if broker.check_liquidation(symbol, current_bar.low if position.side == "long" else current_bar.high, current_bar.timestamp):
+                entry_info = open_entries.pop(symbol, {})
+                trades.append(TradeRecord(
+                    symbol=symbol, side=entry_info.get("side", position.side),
+                    entry_rule=entry_info.get("reason", "unknown"),
+                    exit_reason="liquidation",
+                    entry_time=entry_info.get("entry_time", current_bar.timestamp),
+                    exit_time=current_bar.timestamp,
+                    entry_price=entry_info.get("entry_price", 0),
+                    exit_price=current_bar.low if position.side == "long" else current_bar.high,
+                    quantity=position.quantity,
+                    entry_fee=entry_info.get("entry_fee", 0),
+                    exit_fee=0,
+                    pnl=-position.reserved_margin,
+                    return_pct=-100.0,
+                ))
+                position = broker.get_position(symbol)
+
         # Trailing stop: update best price and check stop
         if position.is_open and symbol in open_entries:
             entry_info = open_entries[symbol]
@@ -167,10 +187,14 @@ def run_backtest(
                 signal_counts[signal.reason] = signal_counts.get(signal.reason, 0) + 1
 
             if signal.action in {"buy", "short"}:
+                stop_dist = 0.0
+                if signal.stop_price and signal.stop_price > 0:
+                    stop_dist = abs(current_bar.close - signal.stop_price) / current_bar.close
                 quantity = calculate_order_quantity(
                     cash=broker.get_cash(),
                     market_price=current_bar.close,
                     limits=limits,
+                    stop_distance_pct=stop_dist,
                 )
                 entry_metadata = {
                     "reason": signal.reason,
