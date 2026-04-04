@@ -5,10 +5,12 @@ Provides both a live Binance fetcher and a static provider for backtesting.
 
 from __future__ import annotations
 
+import csv
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 
@@ -20,6 +22,14 @@ class FuturesSnapshot:
     open_interest: float
     long_short_ratio: float
     taker_buy_sell_ratio: float
+
+    # Coinglass extended fields (all optional, None = no data)
+    oi_close: float | None = None  # Aggregated OI in USD
+    funding_rate: float | None = None  # OI-weighted funding rate
+    liq_long_usd: float | None = None  # Long liquidation volume
+    liq_short_usd: float | None = None  # Short liquidation volume
+    taker_buy_usd: float | None = None  # Taker buy volume
+    taker_sell_usd: float | None = None  # Taker sell volume
 
     @property
     def long_pct(self) -> float:
@@ -43,14 +53,80 @@ class StaticFuturesProvider(FuturesDataProvider):
         self._data = data
         self._sorted_ts = sorted(data.keys())
 
+    def __init__(self, data: dict[datetime, FuturesSnapshot], tolerance_hours: int = 4) -> None:
+        self._data = data
+        self._sorted_ts = sorted(data.keys())
+        self._tolerance_sec = tolerance_hours * 3600
+
     def get_snapshot(self, symbol: str, timestamp: datetime) -> FuturesSnapshot | None:
         if not self._sorted_ts:
             return None
-        # Binary search for nearest timestamp within 4h tolerance
         best_ts = min(self._sorted_ts, key=lambda t: abs((t - timestamp).total_seconds()))
-        if abs((best_ts - timestamp).total_seconds()) > 4 * 3600:
+        if abs((best_ts - timestamp).total_seconds()) > self._tolerance_sec:
             return None
         return self._data[best_ts]
+
+    @classmethod
+    def from_coinglass_csvs(
+        cls,
+        oi_csv: str | Path | None = None,
+        funding_csv: str | Path | None = None,
+        liquidation_csv: str | Path | None = None,
+        taker_csv: str | Path | None = None,
+    ) -> "StaticFuturesProvider":
+        """Build provider from Coinglass CSV files, merging by timestamp."""
+        oi_by_ts: dict[datetime, dict] = {}
+        funding_by_ts: dict[datetime, dict] = {}
+        liq_by_ts: dict[datetime, dict] = {}
+        taker_by_ts: dict[datetime, dict] = {}
+
+        if oi_csv and Path(oi_csv).exists():
+            with open(oi_csv) as f:
+                for row in csv.DictReader(f):
+                    ts = datetime.fromisoformat(row["timestamp"])
+                    oi_by_ts[ts] = row
+
+        if funding_csv and Path(funding_csv).exists():
+            with open(funding_csv) as f:
+                for row in csv.DictReader(f):
+                    ts = datetime.fromisoformat(row["timestamp"])
+                    funding_by_ts[ts] = row
+
+        if liquidation_csv and Path(liquidation_csv).exists():
+            with open(liquidation_csv) as f:
+                for row in csv.DictReader(f):
+                    ts = datetime.fromisoformat(row["timestamp"])
+                    liq_by_ts[ts] = row
+
+        if taker_csv and Path(taker_csv).exists():
+            with open(taker_csv) as f:
+                for row in csv.DictReader(f):
+                    ts = datetime.fromisoformat(row["timestamp"])
+                    taker_by_ts[ts] = row
+
+        all_timestamps = set(oi_by_ts) | set(funding_by_ts) | set(liq_by_ts) | set(taker_by_ts)
+        data: dict[datetime, FuturesSnapshot] = {}
+
+        for ts in all_timestamps:
+            oi = oi_by_ts.get(ts)
+            fund = funding_by_ts.get(ts)
+            liq = liq_by_ts.get(ts)
+            taker = taker_by_ts.get(ts)
+
+            data[ts] = FuturesSnapshot(
+                timestamp=ts,
+                open_interest=float(oi["close"]) if oi else 0.0,
+                long_short_ratio=1.0,
+                taker_buy_sell_ratio=1.0,
+                oi_close=float(oi["close"]) if oi else None,
+                funding_rate=float(fund["close"]) if fund else None,
+                liq_long_usd=float(liq["long_usd"]) if liq else None,
+                liq_short_usd=float(liq["short_usd"]) if liq else None,
+                taker_buy_usd=float(taker["buy_usd"]) if taker else None,
+                taker_sell_usd=float(taker["sell_usd"]) if taker else None,
+            )
+
+        return cls(data)
 
 
 class BinanceFuturesProvider(FuturesDataProvider):

@@ -1,6 +1,8 @@
+from datetime import datetime
 from unittest.mock import patch
 
 from adapters.base import Position
+from adapters.futures_data import FuturesSnapshot, StaticFuturesProvider
 from strategies.trend_breakout import TrendBreakoutConfig, TrendBreakoutStrategy
 from tests.fixtures_synthetic_bars import (
     ascending_channel_breakdown_short_bars,
@@ -982,3 +984,400 @@ def test_adx_filter_blocks_trade_in_weak_trend() -> None:
     )
     result_adx = with_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
     assert result_adx.signal.action == "hold", "ADX filter should block in weak trend"
+
+
+# ── RSI Filter Tests ─────────────────────────────────────────────────────
+
+
+def test_rsi_filter_blocks_long_when_rsi_high() -> None:
+    """RSI filter should block long (buy) when RSI is NOT oversold (RSI > rsi_oversold_threshold).
+
+    At channel support, we only want to buy when RSI confirms oversold conditions.
+    If RSI is elevated, the bounce signal is weak → block.
+    """
+    from tests.fixtures_synthetic_bars import make_bar
+
+    # Build bars where RSI will be HIGH (strong uptrend leading into channel).
+    # 30 bars of steady rise → RSI will be well above 20.
+    rising_prefix = [make_bar(i, 58000 + i * 100) for i in range(30)]
+    channel_bars = ascending_channel_support_long_bars()
+    all_bars = rising_prefix + channel_bars
+
+    # Without RSI filter: should buy
+    no_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+        )
+    )
+    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
+    assert result_no.signal.action == "buy", "Without RSI filter, buy should trigger"
+
+    # With RSI filter: RSI not oversold → block long
+    with_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            rsi_filter=True,
+            rsi_period=3,
+            rsi_oversold=20.0,
+            rsi_overbought=80.0,
+        )
+    )
+    result_rsi = with_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
+    assert result_rsi.signal.action == "hold", "RSI filter should block long when RSI is not oversold"
+
+
+def test_rsi_filter_blocks_short_when_rsi_low() -> None:
+    """RSI filter should block short when RSI is NOT overbought (RSI < rsi_overbought_threshold).
+
+    At channel resistance, we only want to short when RSI confirms overbought conditions.
+    If RSI is low/neutral, the rejection signal is weak → block.
+    """
+    from tests.fixtures_synthetic_bars import make_bar
+
+    # Build bars where RSI will be LOW (steady decline into channel).
+    declining_prefix = [make_bar(i, 72000 - i * 100) for i in range(30)]
+    channel_bars = descending_channel_rejection_short_bars()
+    all_bars = declining_prefix + channel_bars
+
+    # Without RSI filter: should short
+    no_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.004,
+            entry_buffer_pct=0.25,
+            stop_buffer_pct=0.08,
+            allow_longs=False,
+            require_parent_confirmation=False,
+        )
+    )
+    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
+    assert result_no.signal.action == "short", "Without RSI filter, short should trigger"
+
+    # With RSI filter: RSI not overbought → block short
+    with_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.004,
+            entry_buffer_pct=0.25,
+            stop_buffer_pct=0.08,
+            allow_longs=False,
+            require_parent_confirmation=False,
+            rsi_filter=True,
+            rsi_period=3,
+            rsi_oversold=20.0,
+            rsi_overbought=80.0,
+        )
+    )
+    result_rsi = with_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
+    assert result_rsi.signal.action == "hold", "RSI filter should block short when RSI is not overbought"
+
+
+def test_rsi_filter_allows_long_when_oversold() -> None:
+    """RSI filter should ALLOW long when RSI confirms oversold (RSI < rsi_oversold_threshold).
+
+    Mock RSI to return 12 (oversold), so the buy signal passes through the filter.
+    """
+    channel_bars = ascending_channel_support_long_bars()
+
+    with_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            rsi_filter=True,
+            rsi_period=3,
+            rsi_oversold=20.0,
+            rsi_overbought=80.0,
+        )
+    )
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = with_filter.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
+    assert result.signal.action == "buy", "RSI filter should allow long when RSI is oversold"
+
+
+def test_rsi_filter_allows_short_when_overbought() -> None:
+    """RSI filter should ALLOW short when RSI confirms overbought (RSI > rsi_overbought_threshold).
+
+    Mock RSI to return 88 (overbought), so the short signal passes through the filter.
+    """
+    channel_bars = descending_channel_rejection_short_bars()
+
+    with_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.004,
+            entry_buffer_pct=0.25,
+            stop_buffer_pct=0.08,
+            allow_longs=False,
+            require_parent_confirmation=False,
+            rsi_filter=True,
+            rsi_period=3,
+            rsi_oversold=20.0,
+            rsi_overbought=80.0,
+        )
+    )
+    with patch("strategies.trend_breakout._compute_rsi", return_value=88.0):
+        result = with_filter.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
+    assert result.signal.action == "short", "RSI filter should allow short when RSI is overbought"
+
+
+# ── ADX Mode-Aware Tests (Inverted Logic) ────────────────────────────────
+
+
+def test_adx_mode_bounce_blocked_in_strong_trend() -> None:
+    """Bounce trades (support bounce / resistance rejection) should be blocked when ADX > threshold.
+
+    In a strong trend (high ADX), bounces are unreliable — trend will overwhelm the channel boundary.
+    Only breakouts should be allowed in strong trends.
+    """
+    channel_bars = ascending_channel_support_long_bars()
+
+    # Without ADX mode: should buy (bounce)
+    no_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+        )
+    )
+    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
+    assert result_no.signal.action == "buy", "Without ADX mode, bounce should trigger"
+
+    # With adx_mode smart + ADX=40 (high): bounce blocked
+    with_adx = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            adx_filter=True,
+            adx_mode="smart",
+            adx_period=14,
+            adx_threshold=25.0,
+        )
+    )
+    with patch("strategies.trend_breakout._compute_adx", return_value=40.0):
+        result_adx = with_adx.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
+    assert result_adx.signal.action == "hold", "ADX smart mode should block bounce in strong trend"
+
+
+def test_adx_mode_breakout_allowed_in_strong_trend() -> None:
+    """Breakout trades should be ALLOWED when ADX > threshold (strong trend confirms breakout)."""
+    channel_bars = ascending_channel_breakout_long_bars()
+
+    with_adx = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.25,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            adx_filter=True,
+            adx_mode="smart",
+            adx_period=14,
+            adx_threshold=25.0,
+        )
+    )
+    with patch("strategies.trend_breakout._compute_adx", return_value=40.0):
+        result = with_adx.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
+    assert result.signal.action == "buy", "ADX smart mode should allow breakout in strong trend"
+
+
+def test_adx_mode_bounce_allowed_in_ranging_market() -> None:
+    """Bounce trades should be ALLOWED when ADX < threshold (ranging market, bounces reliable)."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    with_adx = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            adx_filter=True,
+            adx_mode="smart",
+            adx_period=14,
+            adx_threshold=25.0,
+        )
+    )
+    with patch("strategies.trend_breakout._compute_adx", return_value=15.0):
+        result = with_adx.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
+    assert result.signal.action == "buy", "ADX smart mode should allow bounce in ranging market"
+
+
+def test_adx_mode_breakout_blocked_in_ranging_market() -> None:
+    """Breakout trades should be BLOCKED when ADX < threshold (weak trend, breakout likely false)."""
+    channel_bars = ascending_channel_breakout_long_bars()
+
+    with_adx = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.25,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            adx_filter=True,
+            adx_mode="smart",
+            adx_period=14,
+            adx_threshold=25.0,
+        )
+    )
+    with patch("strategies.trend_breakout._compute_adx", return_value=15.0):
+        result = with_adx.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
+    assert result.signal.action == "hold", "ADX smart mode should block breakout in ranging market"
+
+
+# ── OI-Price Divergence Filter Tests ───────────────────────────────────
+
+
+def _make_provider_with_oi(bars, oi_current: float, oi_past: float, lookback: int = 6):
+    """Build a StaticFuturesProvider with OI data at current and N-lookback bars."""
+    data = {}
+    if len(bars) > lookback:
+        past_ts = bars[-1 - lookback].timestamp
+        data[past_ts] = FuturesSnapshot(
+            timestamp=past_ts,
+            open_interest=oi_past,
+            long_short_ratio=1.0,
+            taker_buy_sell_ratio=1.0,
+            oi_close=oi_past,
+        )
+    current_ts = bars[-1].timestamp
+    data[current_ts] = FuturesSnapshot(
+        timestamp=current_ts,
+        open_interest=oi_current,
+        long_short_ratio=1.0,
+        taker_buy_sell_ratio=1.0,
+        oi_close=oi_current,
+    )
+    return StaticFuturesProvider(data)
+
+
+def test_oi_divergence_blocks_long_when_price_up_oi_down() -> None:
+    """Rising price + falling OI = weak rally. Block long entry."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            oi_divergence_lookback=6,
+            oi_divergence_threshold=-0.03,
+        )
+    )
+
+    # OI falls from 10B to 9B (-10%) while price rises → block
+    provider = _make_provider_with_oi(channel_bars, oi_current=9e9, oi_past=10e9, lookback=6)
+
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+            futures_provider=provider,
+        )
+    assert result.signal.action == "hold", "OI divergence should block long when price up but OI down"
+    assert "oi_price_divergence" in result.signal.reason
+
+
+def test_oi_divergence_allows_long_when_price_up_oi_up() -> None:
+    """Rising price + rising OI = conviction. Allow long."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            oi_divergence_lookback=6,
+            oi_divergence_threshold=-0.03,
+        )
+    )
+
+    # OI rises from 10B to 11B (+10%) while price rises → allow
+    provider = _make_provider_with_oi(channel_bars, oi_current=11e9, oi_past=10e9, lookback=6)
+
+    result = strategy.evaluate(
+        symbol="BTCUSDT", bars=channel_bars,
+        position=Position(symbol="BTCUSDT"),
+        futures_provider=provider,
+    )
+    # Should NOT be blocked by OI divergence (may still be hold for other reasons)
+    assert result.signal.reason != "oi_price_divergence_blocked"
+
+
+def test_oi_divergence_skipped_when_disabled() -> None:
+    """When oi_divergence_lookback=0, filter is off — signal unchanged."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            oi_divergence_lookback=0,  # Disabled
+        )
+    )
+
+    # Even with falling OI, filter should NOT engage
+    provider = _make_provider_with_oi(channel_bars, oi_current=5e9, oi_past=10e9, lookback=6)
+
+    result = strategy.evaluate(
+        symbol="BTCUSDT", bars=channel_bars,
+        position=Position(symbol="BTCUSDT"),
+        futures_provider=provider,
+    )
+    assert result.signal.reason != "oi_price_divergence_blocked"
+
+
+# ── Funding Rate Extreme Filter Tests ──────────────────────────────────
+
+
+## Removed: funding_rate_extreme and funding_zscore filters
+## Backtest result: crypto funding rate has persistent positive bias (mean 0.9%/day),
+## absolute thresholds block too many normal trades, Z-score variance too high.
+## See PMC (2023): crypto indicators need special adaptation from equity models.

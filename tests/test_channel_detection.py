@@ -99,6 +99,65 @@ def test_parent_detection_rate_at_narrative_midpoints() -> None:
     )
 
 
+def test_parent_direction_accuracy_at_narrative_midpoints() -> None:
+    """Algorithm should get the channel DIRECTION correct at >=62.5% of midpoints.
+
+    Detection rate is already 88%. But 4/7 detected channels have WRONG direction.
+    With R²-weighted scoring + recent-consistency, target: >=5/8 correct direction.
+    """
+    bars = _load_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.02,
+            entry_buffer_pct=0.20,
+            stop_buffer_pct=0.08,
+            use_narrative_regime=False,
+            require_parent_confirmation=True,
+            parent_structure_lookback=360,
+            parent_timeframe_factor=6,
+            parent_pivot_window=3,
+            parent_min_pivot_highs=2,
+            parent_min_pivot_lows=2,
+            max_slope_divergence_ratio=1.5,
+        )
+    )
+
+    correct_direction = 0
+    detected = 0
+    total = len(NARRATIVE_MIDPOINTS)
+
+    for date_str, expected_direction, label in NARRATIVE_MIDPOINTS:
+        history = _get_bars_up_to(bars, date_str)
+        if len(history) < 100:
+            continue
+        evaluation = strategy.evaluate(
+            symbol="BTCUSDT", bars=history, position=Position(symbol="BTCUSDT"),
+        )
+        parent = evaluation.parent_context
+        if parent and parent.get("parent_structure_type") not in {"unknown", None}:
+            detected += 1
+            structure = str(parent.get("parent_structure_type", ""))
+            direction = "descending" if "descending" in structure else "ascending"
+            if direction == expected_direction:
+                correct_direction += 1
+                print(f"  {label:<30} CORRECT: {structure}")
+            else:
+                print(f"  {label:<30} WRONG: {structure} (expected {expected_direction})")
+        else:
+            print(f"  {label:<30} MISSED")
+
+    direction_rate = correct_direction / total
+    print(f"\n  Direction accuracy: {correct_direction}/{total} = {direction_rate:.0%}")
+    print(f"  Detection rate: {detected}/{total}")
+    assert correct_direction >= 5, (
+        f"Direction accuracy {correct_direction}/{total} is below target (5/8). "
+        f"R²-weighted scoring should improve this."
+    )
+
+
 def test_no_narrative_trade_count_minimum() -> None:
     """Without narrative, strategy should find at least 40 trades in 5yr.
 
