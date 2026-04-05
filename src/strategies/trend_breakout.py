@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from statistics import mean
 from typing import Any
 
@@ -29,12 +30,12 @@ class TrendBreakoutConfig:
     Validated filters (backtest-proven):
         - rsi_filter + adx_filter(smart): +32.7%, 50% WR, 19.3% DD
         - Channel direction override: 25% -> 62.5% direction accuracy
+        - OI divergence + Top L/S contrarian (Coinglass)
+        - MTF: 1h entry confirmation (scale mode) + 15m stop refinement
 
-    Optional/experimental filters (disabled by default, 0 overhead):
-        - ma_regime_filter: reduces DD but also reduces profit
-        - crowded_long/short_threshold: needs real OI data (Coinglass)
-        - use_parent_boundary_targets: tested, hurts return (-13%)
-        - use_narrative_regime: legacy, system works better without it
+    Archived filters (see strategies/experimental/):
+        - ma_regime, crowded_oi, liq_cascade, taker_imbalance, basis, cvd
+        - 1h signal generation (hurts returns)
     """
 
     # ── Channel detection ─────────────────────────────────────────
@@ -99,19 +100,26 @@ class TrendBreakoutConfig:
     scale_in_min_profit_pct: float = 0.02  # min unrealized profit% to allow scale-in
     use_trailing_exit: bool = False  # skip fixed target, rely on trailing stop
 
-    # ── Optional filters (disabled by default) ────────────────────
-    ma_regime_filter: bool = False  # +MA200: DD 19.3%->9.6%, WR 50%->61.5%
-    ma_regime_period: int = 200
-    crowded_long_threshold: float = 0.0  # OI filter, needs futures_provider
-    crowded_short_threshold: float = 0.0
+    # ── Impulse profit capture ────────────────────────────────────
+    impulse_trailing_stop_atr: float = 0.0  # wider trailing for breakout trades (0=use default)
+    impulse_harvest_pct: float = 0.0  # % of large-win profit to harvest as USDT (0=disabled)
+    impulse_harvest_min_pnl: float = 0.0  # min BTC profit to trigger harvest (0=any win)
+
+    # ── Proven filters ─────────────────────────────────────────────
     oi_divergence_lookback: int = 0  # 0=disabled. Bars to check OI-price alignment.
     oi_divergence_threshold: float = -0.03  # OI change% below this = "falling" (e.g., -3%)
-    liq_cascade_filter: bool = False  # require liquidation cascade confirmation
-    liq_cascade_min_usd: float = 1_000_000  # min liquidation USD to count as cascade
-    taker_imbalance_filter: bool = False  # require taker buy/sell imbalance confirmation
-    taker_imbalance_min_ratio: float = 1.10  # buy/sell ratio threshold
-    use_parent_boundary_targets: bool = False  # tested: hurts return (-13%)
-    use_narrative_regime: bool = False  # legacy: system works without it
+    top_ls_contrarian: bool = False  # block longs when top traders too long (contrarian)
+    top_ls_threshold: float = 1.5  # L/S ratio above this = too crowded long
+
+    # ── Multi-timeframe entry/stop refinement ─────────────────────
+    mtf_entry_confirmation: bool = False  # require 1h rejection wick to confirm entry
+    mtf_1h_lookback: int = 8  # 1h bars to examine for entry confirmation
+    mtf_1h_min_wick_ratio: float = 0.4  # min wick/range ratio for rejection
+    mtf_1h_sizing_mode: str = "block"  # "block" = hold if no confirm, "scale" = reduce confidence
+    mtf_1h_no_confirm_confidence: float = 0.5  # confidence when 1h doesn't confirm (scale mode)
+    mtf_stop_refinement: bool = False  # use 15m swing low/high for tighter stops
+    mtf_15m_lookback: int = 16  # 15m bars to examine for stop
+    mtf_stop_max_tighten_pct: float = 0.50  # max % of original stop distance that can be removed
 
 
 @dataclass(frozen=True)
@@ -165,8 +173,11 @@ class TrendBreakoutStrategy(Strategy):
     def __init__(self, config: TrendBreakoutConfig | None = None) -> None:
         self.config = config or TrendBreakoutConfig()
 
-    def generate_signal(self, symbol: str, bars: list[MarketBar], position: Position) -> StrategySignal:
-        return self.evaluate(symbol=symbol, bars=bars, position=position).signal
+    def generate_signal(
+        self, symbol: str, bars: list[MarketBar], position: Position,
+        mtf_bars: Any | None = None,
+    ) -> StrategySignal:
+        return self.evaluate(symbol=symbol, bars=bars, position=position, mtf_bars=mtf_bars).signal
 
     def evaluate(
         self,
@@ -174,6 +185,7 @@ class TrendBreakoutStrategy(Strategy):
         bars: list[MarketBar],
         position: Position,
         futures_provider: Any | None = None,
+        mtf_bars: Any | None = None,
     ) -> StrategyEvaluation:
         required_bars = max(self.config.impulse_lookback, self.config.structure_lookback)
         if len(bars) < required_bars:
@@ -223,13 +235,6 @@ class TrendBreakoutStrategy(Strategy):
                 parent_context=None,
             )
 
-        # Narrative regime: look up once and reuse below
-        narrative_parent_context = None
-        if self.config.use_narrative_regime:
-            regime = _lookup_narrative_regime_for_bar(bars[-1])
-            if regime is not None:
-                narrative_parent_context = regime.parent_context
-
         recent = bars[-self.config.structure_lookback :]
         channel, channel_failure = _detect_channel(recent, self.config)
 
@@ -254,10 +259,6 @@ class TrendBreakoutStrategy(Strategy):
         )
 
         parent_context = _build_parent_context(bars, self.config)
-
-        # Override parent context with narrative regime if enabled
-        if narrative_parent_context is not None:
-            parent_context = narrative_parent_context
 
         # Volatility gate: skip when market is too chaotic for structural trades
         if self.config.max_atr_price_ratio > 0:
@@ -293,30 +294,7 @@ class TrendBreakoutStrategy(Strategy):
             if candidate_signal is not None and winning_signal.action == "hold":
                 winning_signal = candidate_signal
 
-        # MA regime filter: block longs below SMA, block shorts above SMA
-        if winning_signal.action != "hold" and self.config.ma_regime_filter:
-            sma_val = _compute_sma(bars, self.config.ma_regime_period)
-            if sma_val is not None:
-                current_close = bars[-1].close
-                if winning_signal.action in ("buy",) and current_close < sma_val:
-                    winning_signal = StrategySignal(action="hold", confidence=0.0, reason="ma_regime_blocked_long")
-                elif winning_signal.action in ("short",) and current_close > sma_val:
-                    winning_signal = StrategySignal(action="hold", confidence=0.0, reason="ma_regime_blocked_short")
-
-        # OI / crowded-trade filter: block longs when crowd is too long, shorts when too short
-        if winning_signal.action != "hold" and futures_provider is not None:
-            snapshot = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
-            if snapshot is not None:
-                if winning_signal.action == "buy" and self.config.crowded_long_threshold > 0:
-                    if snapshot.long_pct >= self.config.crowded_long_threshold * 100:
-                        winning_signal = StrategySignal(
-                            action="hold", confidence=0.0, reason="oi_crowded_long_blocked",
-                        )
-                elif winning_signal.action == "short" and self.config.crowded_short_threshold > 0:
-                    if snapshot.short_pct >= self.config.crowded_short_threshold * 100:
-                        winning_signal = StrategySignal(
-                            action="hold", confidence=0.0, reason="oi_crowded_short_blocked",
-                        )
+        # ── Post-signal filters (only active ones) ─────────────────
 
         # OI-price divergence filter: rising price + falling OI = weak trend
         if (
@@ -354,46 +332,25 @@ class TrendBreakoutStrategy(Strategy):
                         action="hold", confidence=0.0, reason="oi_price_divergence_blocked",
                     )
 
-        # Liquidation cascade confirmation filter
+        # Top trader L/S contrarian filter
         if (
             winning_signal.action != "hold"
             and futures_provider is not None
-            and self.config.liq_cascade_filter
+            and self.config.top_ls_contrarian
         ):
             snap = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
-            if snap is not None:
-                if winning_signal.action == "short":
-                    # Short confirmed by longs getting liquidated
-                    if (snap.liq_long_usd or 0) < self.config.liq_cascade_min_usd:
+            if snap is not None and snap.top_ls_ratio is not None:
+                if winning_signal.action == "buy" and snap.top_ls_ratio > self.config.top_ls_threshold:
+                    # Too many top traders long → contrarian: block longs
+                    winning_signal = StrategySignal(
+                        action="hold", confidence=0.0, reason="top_ls_too_crowded",
+                    )
+                elif winning_signal.action == "short":
+                    # Inverse: if L/S < 1/threshold, shorts are crowded
+                    inverse_threshold = 1.0 / self.config.top_ls_threshold
+                    if snap.top_ls_ratio < inverse_threshold:
                         winning_signal = StrategySignal(
-                            action="hold", confidence=0.0, reason="liq_cascade_not_confirmed",
-                        )
-                elif winning_signal.action == "buy":
-                    # Long confirmed by shorts getting liquidated
-                    if (snap.liq_short_usd or 0) < self.config.liq_cascade_min_usd:
-                        winning_signal = StrategySignal(
-                            action="hold", confidence=0.0, reason="liq_cascade_not_confirmed",
-                        )
-
-        # Taker buy/sell imbalance confirmation filter
-        if (
-            winning_signal.action != "hold"
-            and futures_provider is not None
-            and self.config.taker_imbalance_filter
-        ):
-            snap = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
-            if snap is not None:
-                buy_usd = snap.taker_buy_usd or 0
-                sell_usd = snap.taker_sell_usd or 0
-                if winning_signal.action == "buy" and sell_usd > 0:
-                    if buy_usd / sell_usd < self.config.taker_imbalance_min_ratio:
-                        winning_signal = StrategySignal(
-                            action="hold", confidence=0.0, reason="taker_imbalance_not_confirmed",
-                        )
-                elif winning_signal.action == "short" and buy_usd > 0:
-                    if sell_usd / buy_usd < self.config.taker_imbalance_min_ratio:
-                        winning_signal = StrategySignal(
-                            action="hold", confidence=0.0, reason="taker_imbalance_not_confirmed",
+                            action="hold", confidence=0.0, reason="top_ls_too_crowded",
                         )
 
         # ADX trend strength filter
@@ -433,9 +390,6 @@ class TrendBreakoutStrategy(Strategy):
                         action="hold", confidence=0.0, reason="rsi_not_overbought_blocked",
                     )
 
-        if winning_signal.action != "hold" and self.config.use_parent_boundary_targets:
-            winning_signal = _extend_target_to_parent_boundary(winning_signal, parent_context)
-
         if winning_signal.action != "hold" and self.config.min_stop_atr_multiplier > 0:
             winning_signal = _apply_atr_stop_floor(
                 winning_signal, recent, self.config.atr_lookback, self.config.min_stop_atr_multiplier,
@@ -443,17 +397,167 @@ class TrendBreakoutStrategy(Strategy):
 
         if winning_signal.action != "hold" and self.config.trailing_stop_atr > 0:
             meta = dict(winning_signal.metadata) if winning_signal.metadata else {}
-            meta["trailing_stop_atr"] = self.config.trailing_stop_atr
+            is_breakout = winning_signal.reason in _BREAKOUT_RULES
+            if is_breakout and self.config.impulse_trailing_stop_atr > 0:
+                meta["trailing_stop_atr"] = self.config.impulse_trailing_stop_atr
+                meta["trade_type"] = "impulse"
+            else:
+                meta["trailing_stop_atr"] = self.config.trailing_stop_atr
+            # Breakout trades: no fixed target, pure trailing exit
+            target = None if is_breakout and self.config.use_trailing_exit else winning_signal.target_price
             winning_signal = StrategySignal(
                 action=winning_signal.action,
                 confidence=winning_signal.confidence,
                 reason=winning_signal.reason,
                 stop_price=winning_signal.stop_price,
-                target_price=winning_signal.target_price,
+                target_price=target,
                 metadata=meta,
             )
 
+        # ── Multi-timeframe refinement (1h entry + 15m stop) ─────────
+        if winning_signal.action != "hold" and mtf_bars is not None:
+            # 1h entry confirmation: require rejection wick at support/resistance
+            if self.config.mtf_entry_confirmation:
+                winning_signal = self._mtf_confirm_entry(
+                    winning_signal, mtf_bars, bars[-1].timestamp,
+                )
+            # 15m stop refinement: tighten stop using micro-structure
+            if winning_signal.action != "hold" and self.config.mtf_stop_refinement:
+                winning_signal = self._mtf_refine_stop(
+                    winning_signal, mtf_bars, bars[-1].timestamp, bars[-1].close,
+                )
+
         return StrategyEvaluation(signal=winning_signal, rule_evaluations=rule_evals, parent_context=parent_context)
+
+    def _mtf_confirm_entry(
+        self,
+        signal: StrategySignal,
+        mtf_bars: Any,
+        current_time: datetime,
+    ) -> StrategySignal:
+        """Confirm entry using 1h bar rejection wick.
+
+        For longs: last 1h bar should show bullish rejection (long lower wick).
+        For shorts: last 1h bar should show bearish rejection (long upper wick).
+
+        In "block" mode: no confirmation → hold (skip trade).
+        In "scale" mode: no confirmation → pass through with reduced confidence.
+        """
+        bars_1h = mtf_bars.get_history("1h", as_of=current_time, lookback=self.config.mtf_1h_lookback)
+        if not bars_1h:
+            return signal  # no 1h data → pass through (graceful degradation)
+
+        last_1h = bars_1h[-1]
+        bar_range = last_1h.high - last_1h.low
+        if bar_range <= 0:
+            return self._mtf_1h_no_confirm(signal)
+
+        confirmed = False
+        if signal.action == "buy":
+            # Bullish rejection: long lower wick relative to range
+            lower_wick = min(last_1h.open, last_1h.close) - last_1h.low
+            confirmed = lower_wick / bar_range >= self.config.mtf_1h_min_wick_ratio
+        elif signal.action == "short":
+            # Bearish rejection: long upper wick relative to range
+            upper_wick = last_1h.high - max(last_1h.open, last_1h.close)
+            confirmed = upper_wick / bar_range >= self.config.mtf_1h_min_wick_ratio
+
+        if confirmed:
+            # Full confidence on confirmation → full position size
+            meta = {**(signal.metadata or {}), "mtf_sizing": 1.0}
+            return StrategySignal(
+                action=signal.action,
+                confidence=1.0,
+                reason=signal.reason,
+                stop_price=signal.stop_price,
+                target_price=signal.target_price,
+                metadata=meta,
+            )
+
+        return self._mtf_1h_no_confirm(signal)
+
+    def _mtf_1h_no_confirm(self, signal: StrategySignal) -> StrategySignal:
+        """Handle no 1h confirmation based on sizing mode."""
+        if self.config.mtf_1h_sizing_mode == "scale":
+            # Scale mode: pass through with reduced position size
+            sizing = self.config.mtf_1h_no_confirm_confidence
+            meta = {**(signal.metadata or {}), "mtf_sizing": sizing}
+            return StrategySignal(
+                action=signal.action,
+                confidence=sizing,
+                reason=signal.reason,
+                stop_price=signal.stop_price,
+                target_price=signal.target_price,
+                metadata=meta,
+            )
+        # Block mode: hold
+        return StrategySignal(action="hold", confidence=0.0, reason="mtf_1h_no_confirmation")
+
+    def _mtf_refine_stop(
+        self,
+        signal: StrategySignal,
+        mtf_bars: Any,
+        current_time: datetime,
+        entry_price: float,
+    ) -> StrategySignal:
+        """Tighten stop using 15m micro-structure.
+
+        For longs: use 15m swing low (min of recent lows) as stop if tighter.
+        For shorts: use 15m swing high (max of recent highs) as stop if tighter.
+        Only tightens, never widens.  Respects max_tighten_pct to prevent
+        noise-induced micro-stops.
+        """
+        if signal.stop_price is None:
+            return signal
+
+        bars_15m = mtf_bars.get_history("15m", as_of=current_time, lookback=self.config.mtf_15m_lookback)
+        if len(bars_15m) < 2:
+            return signal  # not enough 15m data
+
+        max_tighten = self.config.mtf_stop_max_tighten_pct
+
+        if signal.action == "buy":
+            original_distance = entry_price - signal.stop_price
+            if original_distance <= 0:
+                return signal
+            # For long: swing low from 15m is a tighter stop (higher = tighter)
+            swing_low = min(b.low for b in bars_15m)
+            refined_stop = swing_low * 0.998
+            # Clamp: refined stop can't remove more than max_tighten of original distance
+            max_stop = entry_price - original_distance * (1.0 - max_tighten)
+            refined_stop = min(refined_stop, max_stop)
+            # Only tighten (move stop up for longs)
+            if refined_stop > signal.stop_price:
+                return StrategySignal(
+                    action=signal.action,
+                    confidence=signal.confidence,
+                    reason=signal.reason,
+                    stop_price=refined_stop,
+                    target_price=signal.target_price,
+                    metadata=signal.metadata,
+                )
+        elif signal.action == "short":
+            original_distance = signal.stop_price - entry_price
+            if original_distance <= 0:
+                return signal
+            # For short: swing high from 15m is a tighter stop (lower = tighter)
+            swing_high = max(b.high for b in bars_15m)
+            refined_stop = swing_high * 1.002
+            # Clamp: refined stop can't remove more than max_tighten of original distance
+            min_stop = entry_price + original_distance * (1.0 - max_tighten)
+            refined_stop = max(refined_stop, min_stop)
+            # Only tighten (move stop down for shorts)
+            if refined_stop < signal.stop_price:
+                return StrategySignal(
+                    action=signal.action,
+                    confidence=signal.confidence,
+                    reason=signal.reason,
+                    stop_price=refined_stop,
+                    target_price=signal.target_price,
+                    metadata=signal.metadata,
+                )
+
+        return signal
 
     def _check_ascending_channel_support_bounce(
         self,
@@ -1524,39 +1628,6 @@ _BREAKOUT_RULES: set[str] = {
 }
 
 
-def _extend_target_to_parent_boundary(
-    signal: StrategySignal,
-    parent_context: dict[str, float | str | None] | None,
-) -> StrategySignal:
-    """Extend the target price to the parent channel boundary when it's further
-    in the profitable direction than the local channel target."""
-    if parent_context is None or signal.target_price is None:
-        return signal
-    if signal.action == "short":
-        parent_lower = parent_context.get("parent_lower_boundary")
-        if parent_lower is not None and isinstance(parent_lower, (int, float)) and parent_lower < signal.target_price:
-            return StrategySignal(
-                action=signal.action,
-                confidence=signal.confidence,
-                reason=signal.reason,
-                stop_price=signal.stop_price,
-                target_price=parent_lower,
-                metadata=signal.metadata,
-            )
-    elif signal.action == "buy":
-        parent_upper = parent_context.get("parent_upper_boundary")
-        if parent_upper is not None and isinstance(parent_upper, (int, float)) and parent_upper > signal.target_price:
-            return StrategySignal(
-                action=signal.action,
-                confidence=signal.confidence,
-                reason=signal.reason,
-                stop_price=signal.stop_price,
-                target_price=parent_upper,
-                metadata=signal.metadata,
-            )
-    return signal
-
-
 def _apply_atr_stop_floor(
     signal: StrategySignal,
     bars: list[MarketBar],
@@ -1626,13 +1697,3 @@ def _volume_expansion_ratio(bars: list[MarketBar]) -> float:
     return latest / baseline
 
 
-# ── Narrative regime integration ────────────────────────────────────
-
-
-def _lookup_narrative_regime_for_bar(bar: MarketBar):
-    """Look up the narrative regime for a bar's date.  Returns None on import failure."""
-    try:
-        from research.narrative_regime import lookup_narrative_regime
-    except ImportError:
-        return None
-    return lookup_narrative_regime(bar.timestamp.date(), current_price=bar.close)

@@ -60,7 +60,7 @@ def test_parent_detection_rate_at_narrative_midpoints() -> None:
             impulse_threshold_pct=0.02,
             entry_buffer_pct=0.20,
             stop_buffer_pct=0.08,
-            use_narrative_regime=False,
+
             require_parent_confirmation=True,
             # Extended parent detection parameters:
             parent_structure_lookback=360,
@@ -114,7 +114,7 @@ def test_parent_direction_accuracy_at_narrative_midpoints() -> None:
             impulse_threshold_pct=0.02,
             entry_buffer_pct=0.20,
             stop_buffer_pct=0.08,
-            use_narrative_regime=False,
+
             require_parent_confirmation=True,
             parent_structure_lookback=360,
             parent_timeframe_factor=6,
@@ -179,7 +179,7 @@ def test_no_narrative_trade_count_minimum() -> None:
             min_r_squared=0.0,
             min_stop_atr_multiplier=1.5,
             time_stop_bars=84,
-            use_narrative_regime=False,
+
             require_parent_confirmation=True,
             # Improved parent detection:
             parent_structure_lookback=360,

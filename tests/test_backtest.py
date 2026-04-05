@@ -233,7 +233,6 @@ def test_build_default_strategy_includes_quality_filters() -> None:
     assert config.min_stop_atr_multiplier >= 1.0, "ATR stop floor should prevent noise stop-outs"
     assert config.impulse_threshold_pct <= 0.03, "Lower impulse threshold captures more setups"
     assert config.time_stop_bars is not None and config.time_stop_bars > 0, "Time stop cuts losing trades"
-    assert config.use_narrative_regime is True
     assert config.secondary_structure_lookback is not None, "Dual lookback captures more regimes"
 
 

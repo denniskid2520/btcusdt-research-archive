@@ -477,131 +477,6 @@ def test_shock_override_blocks_rising_channel_continuation_short() -> None:
     assert continuation_eval.first_failed_condition == "shock_override_active"
 
 
-def test_parent_boundary_extends_short_target_to_parent_lower() -> None:
-    """When parent has a lower boundary further than the local target,
-    the short signal's target_price should extend to the parent lower boundary."""
-    strategy = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            use_parent_boundary_targets=True,
-            require_parent_confirmation=False,
-        )
-    )
-    # Parent descending channel with lower boundary at 52000
-    # Local channel is around 60-70k, so local target would be ~support - width ≈ 55k
-    # Parent lower boundary at 52000 is further → should be used as target
-    forced_parent = {
-        "parent_structure_type": "descending_channel",
-        "parent_upper_boundary": 70000.0,
-        "parent_lower_boundary": 52000.0,
-        "parent_position_in_channel": "near_upper_boundary",
-        "parent_event_type": "normal",
-    }
-    with patch("strategies.trend_breakout._build_parent_context", return_value=forced_parent):
-        evaluation = strategy.evaluate(
-            symbol="BTCUSDT",
-            bars=descending_channel_rejection_short_bars(),
-            position=Position(symbol="BTCUSDT"),
-        )
-    assert evaluation.signal.action == "short"
-    assert evaluation.signal.target_price is not None
-    # The target should be the parent lower boundary (52000), not local channel width
-    assert evaluation.signal.target_price == 52000.0
-
-
-def test_parent_boundary_extends_long_target_to_parent_upper() -> None:
-    """When parent has an upper boundary further than the local target,
-    the long signal's target_price should extend to the parent upper boundary."""
-    strategy = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.03,
-            entry_buffer_pct=0.35,
-            stop_buffer_pct=0.08,
-            allow_shorts=False,
-            use_parent_boundary_targets=True,
-            require_parent_confirmation=False,
-        )
-    )
-    # Parent ascending channel with upper boundary at 76000
-    # Local channel is around 50-58k, so local target ≈ resistance ~ 58k
-    # Parent upper boundary at 76000 is further → should be used as target
-    forced_parent = {
-        "parent_structure_type": "ascending_channel",
-        "parent_upper_boundary": 76000.0,
-        "parent_lower_boundary": 50000.0,
-        "parent_position_in_channel": "near_lower_boundary",
-        "parent_event_type": "normal",
-    }
-    with patch("strategies.trend_breakout._build_parent_context", return_value=forced_parent):
-        evaluation = strategy.evaluate(
-            symbol="BTCUSDT",
-            bars=ascending_channel_support_long_bars(),
-            position=Position(symbol="BTCUSDT"),
-        )
-    assert evaluation.signal.action == "buy"
-    assert evaluation.signal.target_price is not None
-    assert evaluation.signal.target_price == 76000.0
-
-
-def test_parent_boundary_does_not_shrink_local_target() -> None:
-    """If parent boundary is closer than local target, keep local target."""
-    strategy = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            use_parent_boundary_targets=True,
-            require_parent_confirmation=False,
-        )
-    )
-    # Parent lower boundary at 60000 — close to or above the local target
-    forced_parent = {
-        "parent_structure_type": "descending_channel",
-        "parent_upper_boundary": 70000.0,
-        "parent_lower_boundary": 60000.0,
-        "parent_position_in_channel": "near_upper_boundary",
-        "parent_event_type": "normal",
-    }
-
-    # First get the local-only target
-    local_strategy = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            use_parent_boundary_targets=False,
-            require_parent_confirmation=False,
-        )
-    )
-    with patch("strategies.trend_breakout._build_parent_context", return_value=forced_parent):
-        local_eval = local_strategy.evaluate(
-            symbol="BTCUSDT",
-            bars=descending_channel_rejection_short_bars(),
-            position=Position(symbol="BTCUSDT"),
-        )
-        extended_eval = strategy.evaluate(
-            symbol="BTCUSDT",
-            bars=descending_channel_rejection_short_bars(),
-            position=Position(symbol="BTCUSDT"),
-        )
-    assert local_eval.signal.action == "short"
-    assert extended_eval.signal.action == "short"
-    # Extended target should not be worse than local target
-    assert extended_eval.signal.target_price <= local_eval.signal.target_price
-
 
 def test_secondary_lookback_detects_channel_when_primary_fails() -> None:
     """When primary structure_lookback can't detect a channel, the secondary
@@ -750,190 +625,6 @@ def test_ascending_channel_breakdown_short() -> None:
     assert result.signal.target_price is not None
     triggered = [r for r in result.rule_evaluations if r.rule_name == "ascending_channel_breakdown_short" and r.triggered]
     assert triggered, "ascending_channel_breakdown_short rule should trigger"
-
-
-def test_ma_regime_filter_blocks_long_when_below_sma200() -> None:
-    """When ma_regime_filter is enabled and price < SMA200, longs should be blocked."""
-    from tests.fixtures_synthetic_bars import make_bar
-
-    # Build 200 bars at high price (~70k) then append ascending channel support bars (~57k).
-    # SMA200 will be ~70k, channel support close ~57750 → below SMA200 → longs blocked.
-    high_bars = [make_bar(i, 70000.0) for i in range(200)]
-    channel_bars = ascending_channel_support_long_bars()
-    all_bars = high_bars + channel_bars
-
-    # Without MA filter: should generate buy
-    no_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.03,
-            entry_buffer_pct=0.35,
-            stop_buffer_pct=0.08,
-            allow_shorts=False,
-            require_parent_confirmation=False,
-            ma_regime_filter=False,
-        )
-    )
-    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
-    assert result_no.signal.action == "buy", "Without MA filter, long should trigger"
-
-    # With MA filter: close < SMA200 → long blocked
-    with_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.03,
-            entry_buffer_pct=0.35,
-            stop_buffer_pct=0.08,
-            allow_shorts=False,
-            require_parent_confirmation=False,
-            ma_regime_filter=True,
-            ma_regime_period=200,
-        )
-    )
-    result_ma = with_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
-    assert result_ma.signal.action == "hold", "MA filter should block long when price < SMA200"
-
-
-def test_ma_regime_filter_blocks_short_when_above_sma200() -> None:
-    """When ma_regime_filter is enabled and price > SMA200, shorts should be blocked."""
-    from tests.fixtures_synthetic_bars import make_bar
-
-    # Build 200 bars at low price (~55k) then append descending channel rejection bars (~61-70k).
-    # SMA200 will be ~56k, rejection close ~61300 → above SMA200 → shorts blocked.
-    # Use 55k (close to channel start ~70k) so impulse within channel is not destroyed.
-    low_bars = [make_bar(i, 55000.0) for i in range(200)]
-    channel_bars = descending_channel_rejection_short_bars()
-    all_bars = low_bars + channel_bars
-
-    # Without MA filter: should short (use 0.004 threshold matching original fixture test)
-    no_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            require_parent_confirmation=False,
-            ma_regime_filter=False,
-        )
-    )
-    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
-    assert result_no.signal.action == "short", "Without MA filter, short should trigger"
-
-    # With MA filter: close > SMA200 → short blocked
-    with_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            require_parent_confirmation=False,
-            ma_regime_filter=True,
-            ma_regime_period=200,
-        )
-    )
-    result_ma = with_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
-    assert result_ma.signal.action == "hold", "MA filter should block short when price > SMA200"
-
-
-def test_oi_filter_blocks_long_when_crowd_is_long() -> None:
-    """When OI filter is enabled and long% is extreme, longs should be blocked (crowded trade)."""
-    from adapters.futures_data import FuturesSnapshot, StaticFuturesProvider
-    from tests.fixtures_synthetic_bars import make_bar
-
-    channel_bars = ascending_channel_support_long_bars()
-    # Crowded long: L/S ratio = 2.5 → 71.4% long
-    ts = channel_bars[-1].timestamp
-    provider = StaticFuturesProvider({
-        ts: FuturesSnapshot(timestamp=ts, open_interest=90000.0, long_short_ratio=2.5, taker_buy_sell_ratio=0.8),
-    })
-
-    # Without OI filter: should buy
-    no_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.03,
-            entry_buffer_pct=0.35,
-            stop_buffer_pct=0.08,
-            allow_shorts=False,
-            require_parent_confirmation=False,
-        )
-    )
-    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
-    assert result_no.signal.action == "buy"
-
-    # With OI filter: crowded long → block
-    with_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.03,
-            entry_buffer_pct=0.35,
-            stop_buffer_pct=0.08,
-            allow_shorts=False,
-            require_parent_confirmation=False,
-            crowded_long_threshold=0.70,
-            crowded_short_threshold=0.70,
-        )
-    )
-    result_oi = with_filter.evaluate(
-        symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"),
-        futures_provider=provider,
-    )
-    assert result_oi.signal.action == "hold", "OI filter should block long when crowd is 71% long"
-
-
-def test_oi_filter_blocks_short_when_crowd_is_short() -> None:
-    """When OI filter is enabled and short% is extreme, shorts should be blocked."""
-    from adapters.futures_data import FuturesSnapshot, StaticFuturesProvider
-
-    channel_bars = descending_channel_rejection_short_bars()
-    # Crowded short: L/S ratio = 0.4 → long_pct = 28.6%, short_pct = 71.4%
-    ts = channel_bars[-1].timestamp
-    provider = StaticFuturesProvider({
-        ts: FuturesSnapshot(timestamp=ts, open_interest=90000.0, long_short_ratio=0.4, taker_buy_sell_ratio=1.2),
-    })
-
-    # Without OI filter: should short (use 0.004 threshold matching existing evaluate() tests)
-    no_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            require_parent_confirmation=False,
-        )
-    )
-    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"))
-    assert result_no.signal.action == "short"
-
-    # With OI filter: crowded short → block
-    with_filter = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            require_parent_confirmation=False,
-            crowded_long_threshold=0.70,
-            crowded_short_threshold=0.70,
-        )
-    )
-    result_oi = with_filter.evaluate(
-        symbol="BTCUSDT", bars=channel_bars, position=Position(symbol="BTCUSDT"),
-        futures_provider=provider,
-    )
-    assert result_oi.signal.action == "hold", "OI filter should block short when crowd is 71% short"
 
 
 def test_adx_filter_blocks_trade_in_weak_trend() -> None:
@@ -1513,88 +1204,28 @@ def test_trailing_exit_still_respects_stop() -> None:
     assert signal.action == "sell"
 
 
-# ── Phase 2: Liquidation / Taker Volume Filter Tests ────────────────────
+# ── Coinglass filter tests ────────────────────────────────────────
 
 
-def _make_provider_with_liq_taker(bars, liq_long=0.0, liq_short=0.0, buy_usd=0.0, sell_usd=0.0):
-    """Helper: provider with liquidation + taker data at the current bar timestamp."""
-    ts = bars[-1].timestamp
-    snap = FuturesSnapshot(
-        timestamp=ts,
-        open_interest=1e9,
-        long_short_ratio=1.0,
-        taker_buy_sell_ratio=1.0,
-        oi_close=1e9,
-        liq_long_usd=liq_long,
-        liq_short_usd=liq_short,
-        taker_buy_usd=buy_usd,
-        taker_sell_usd=sell_usd,
-    )
-    return StaticFuturesProvider({ts: snap})
-
-
-def test_liq_cascade_confirms_short_when_longs_liquidated() -> None:
-    """Short signal + large long liquidations = confirmed (pass through)."""
-    channel_bars = descending_channel_rejection_short_bars()
-
-    strategy = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            require_parent_confirmation=False,
-            liq_cascade_filter=True,
-            liq_cascade_min_usd=500_000,
+def _make_provider_with_new_fields(bars, top_ls_ratio=1.0, cvd=0.0, basis=0.0):
+    """Helper: provider with top_ls_ratio, cvd, basis at each bar timestamp."""
+    data = {}
+    for b in bars:
+        data[b.timestamp] = FuturesSnapshot(
+            timestamp=b.timestamp,
+            open_interest=1e9,
+            long_short_ratio=1.0,
+            taker_buy_sell_ratio=1.0,
+            oi_close=1e9,
+            top_ls_ratio=top_ls_ratio,
+            cvd=cvd,
+            basis=basis,
         )
-    )
-
-    provider = _make_provider_with_liq_taker(
-        channel_bars, liq_long=1_000_000, liq_short=100_000,
-    )
-
-    result = strategy.evaluate(
-        symbol="BTCUSDT", bars=channel_bars,
-        position=Position(symbol="BTCUSDT"),
-        futures_provider=provider,
-    )
-    assert result.signal.action == "short"
+    return StaticFuturesProvider(data)
 
 
-def test_liq_cascade_blocks_short_when_no_long_liquidation() -> None:
-    """Short signal without enough long liquidation = blocked."""
-    channel_bars = descending_channel_rejection_short_bars()
-
-    strategy = TrendBreakoutStrategy(
-        TrendBreakoutConfig(
-            impulse_lookback=12,
-            structure_lookback=24,
-            impulse_threshold_pct=0.004,
-            entry_buffer_pct=0.25,
-            stop_buffer_pct=0.08,
-            allow_longs=False,
-            require_parent_confirmation=False,
-            liq_cascade_filter=True,
-            liq_cascade_min_usd=500_000,
-        )
-    )
-
-    provider = _make_provider_with_liq_taker(
-        channel_bars, liq_long=100_000, liq_short=100_000,  # not enough
-    )
-
-    result = strategy.evaluate(
-        symbol="BTCUSDT", bars=channel_bars,
-        position=Position(symbol="BTCUSDT"),
-        futures_provider=provider,
-    )
-    assert result.signal.reason == "liq_cascade_not_confirmed"
-
-
-def test_taker_imbalance_confirms_long_when_buy_dominant() -> None:
-    """Long signal + taker buy dominance = confirmed."""
+def test_top_ls_contrarian_blocks_long_when_too_crowded() -> None:
+    """Block long signal when top traders are too heavily long (contrarian)."""
     channel_bars = ascending_channel_support_long_bars()
 
     strategy = TrendBreakoutStrategy(
@@ -1606,14 +1237,41 @@ def test_taker_imbalance_confirms_long_when_buy_dominant() -> None:
             stop_buffer_pct=0.08,
             allow_shorts=False,
             require_parent_confirmation=False,
-            taker_imbalance_filter=True,
-            taker_imbalance_min_ratio=1.1,
+            top_ls_contrarian=True,
+            top_ls_threshold=1.5,
         )
     )
 
-    provider = _make_provider_with_liq_taker(
-        channel_bars, buy_usd=2_000_000, sell_usd=1_500_000,  # ratio 1.33 > 1.1
+    provider = _make_provider_with_new_fields(channel_bars, top_ls_ratio=2.0)  # too crowded
+
+    result = strategy.evaluate(
+        symbol="BTCUSDT", bars=channel_bars,
+        position=Position(symbol="BTCUSDT"),
+        futures_provider=provider,
     )
+    assert result.signal.action == "hold"
+    assert result.signal.reason == "top_ls_too_crowded"
+
+
+def test_top_ls_contrarian_allows_long_when_not_crowded() -> None:
+    """Allow long signal when top traders are balanced."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            top_ls_contrarian=True,
+            top_ls_threshold=1.5,
+        )
+    )
+
+    provider = _make_provider_with_new_fields(channel_bars, top_ls_ratio=1.2)  # not crowded
 
     result = strategy.evaluate(
         symbol="BTCUSDT", bars=channel_bars,
@@ -1623,31 +1281,33 @@ def test_taker_imbalance_confirms_long_when_buy_dominant() -> None:
     assert result.signal.action == "buy"
 
 
-def test_taker_imbalance_blocks_long_when_sell_dominant() -> None:
-    """Long signal + sell-dominant taker = blocked."""
-    channel_bars = ascending_channel_support_long_bars()
+def test_top_ls_contrarian_blocks_short_when_too_crowded_short() -> None:
+    """Block short signal when top traders are too heavily short (contrarian)."""
+    channel_bars = descending_channel_rejection_short_bars()
 
     strategy = TrendBreakoutStrategy(
         TrendBreakoutConfig(
             impulse_lookback=12,
             structure_lookback=24,
-            impulse_threshold_pct=0.03,
-            entry_buffer_pct=0.35,
+            impulse_threshold_pct=0.004,
+            entry_buffer_pct=0.25,
             stop_buffer_pct=0.08,
-            allow_shorts=False,
+            allow_longs=False,
             require_parent_confirmation=False,
-            taker_imbalance_filter=True,
-            taker_imbalance_min_ratio=1.1,
+            top_ls_contrarian=True,
+            top_ls_threshold=1.5,
         )
     )
 
-    provider = _make_provider_with_liq_taker(
-        channel_bars, buy_usd=1_000_000, sell_usd=2_000_000,  # buy/sell = 0.5 < 1.1
-    )
+    # L/S ratio below 1/1.5 = 0.667 means shorts are crowded
+    provider = _make_provider_with_new_fields(channel_bars, top_ls_ratio=0.5)
 
     result = strategy.evaluate(
         symbol="BTCUSDT", bars=channel_bars,
         position=Position(symbol="BTCUSDT"),
         futures_provider=provider,
     )
-    assert result.signal.reason == "taker_imbalance_not_confirmed"
+    assert result.signal.action == "hold"
+    assert result.signal.reason == "top_ls_too_crowded"
+
+

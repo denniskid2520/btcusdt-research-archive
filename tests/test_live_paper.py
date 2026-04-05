@@ -32,7 +32,7 @@ def test_live_paper_runner_processes_tick_and_generates_state() -> None:
     """A single tick should evaluate the strategy and return updated state."""
     runner = LivePaperRunner(
         adapter=BinanceStubAdapter(),
-        strategy=build_default_strategy(use_narrative_regime=False),
+        strategy=build_default_strategy(),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.001, slippage_rate=0.0005),
         limits=RiskLimits(),
         symbol="BTCUSDT",
@@ -50,7 +50,7 @@ def test_live_paper_runner_opens_and_manages_position_over_ticks() -> None:
     """Multiple ticks should allow the runner to open and manage positions."""
     runner = LivePaperRunner(
         adapter=BinanceStubAdapter(),
-        strategy=build_default_strategy(use_narrative_regime=False),
+        strategy=build_default_strategy(),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.001, slippage_rate=0.0005),
         limits=RiskLimits(),
         symbol="BTCUSDT",
@@ -67,7 +67,7 @@ def test_live_paper_runner_trade_log_records_fills() -> None:
     """Completed trades should appear in the runner's trade log."""
     runner = LivePaperRunner(
         adapter=BinanceStubAdapter(),
-        strategy=build_default_strategy(use_narrative_regime=False),
+        strategy=build_default_strategy(),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.001, slippage_rate=0.0005),
         limits=RiskLimits(),
         symbol="BTCUSDT",
@@ -91,7 +91,7 @@ def test_live_paper_replay_generates_trades_on_real_data() -> None:
     adapter = ReplayAdapter(bars)
     runner = LivePaperRunner(
         adapter=adapter,
-        strategy=build_default_strategy(use_narrative_regime=True),
+        strategy=build_default_strategy(),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.001, slippage_rate=0.0005),
         limits=RiskLimits(),
         symbol="BTCUSDT",

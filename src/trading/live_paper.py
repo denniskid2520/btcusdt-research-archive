@@ -284,7 +284,7 @@ def main() -> None:
 
     runner = LivePaperRunner(
         adapter=BinanceLiveAdapter(),
-        strategy=build_default_strategy(use_narrative_regime=True),
+        strategy=build_default_strategy(),
         broker=PaperBroker(initial_cash=args.initial_cash, fee_rate=0.001, slippage_rate=0.0005),
         limits=RiskLimits(),
         symbol=args.symbol,

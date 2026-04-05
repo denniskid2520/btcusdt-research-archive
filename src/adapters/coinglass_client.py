@@ -1,6 +1,6 @@
 """Thin Coinglass API v4 client for fetching derivatives data.
 
-Supports: OI history, funding rate, liquidation, taker buy/sell volume.
+Supports: OI, funding rate, liquidation, taker volume, top L/S ratio, CVD, basis.
 Rate-limited to 30 req/min (Hobbyist plan).
 """
 
@@ -43,6 +43,35 @@ class TakerVolumeBar:
     timestamp: datetime
     buy_usd: float
     sell_usd: float
+
+
+@dataclass(frozen=True)
+class TopLSRatioBar:
+    """Top trader position long/short ratio (per-exchange)."""
+
+    timestamp: datetime
+    long_percent: float
+    short_percent: float
+    ratio: float
+
+
+@dataclass(frozen=True)
+class CVDBar:
+    """Cumulative Volume Delta (cross-exchange aggregated)."""
+
+    timestamp: datetime
+    buy_vol: float
+    sell_vol: float
+    cvd: float
+
+
+@dataclass(frozen=True)
+class BasisBar:
+    """Futures basis / premium (per-exchange)."""
+
+    timestamp: datetime
+    open_basis: float
+    close_basis: float
 
 
 class CoinglassClient:
@@ -263,13 +292,174 @@ class CoinglassClient:
         unique.sort(key=lambda b: b.timestamp)
         return unique
 
-    def _get_json(self, path: str, params: dict | None = None) -> list | dict:
-        """Make a rate-limited GET request."""
-        # Rate limiting
-        elapsed = time.time() - self._last_request_time
-        if elapsed < self.MIN_REQUEST_INTERVAL:
-            time.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
+    def fetch_top_ls_ratio_history(
+        self,
+        exchange: str = "Binance",
+        symbol: str = "BTCUSDT",
+        interval: str = "4h",
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[TopLSRatioBar]:
+        """Fetch top trader position long/short ratio history (per-exchange)."""
+        all_bars: list[TopLSRatioBar] = []
+        current_end = end_time
 
+        while True:
+            params = {
+                "exchange": exchange,
+                "symbol": symbol,
+                "interval": interval,
+                "limit": self.MAX_LIMIT,
+            }
+            if start_time is not None:
+                params["startTime"] = start_time
+            if current_end is not None:
+                params["endTime"] = current_end
+
+            data = self._get_json("/api/futures/top-long-short-position-ratio/history", params)
+            if not data:
+                break
+
+            bars = [
+                TopLSRatioBar(
+                    timestamp=datetime.fromtimestamp(d["time"] / 1000, tz=timezone.utc).replace(tzinfo=None),
+                    long_percent=float(d["top_position_long_percent"]),
+                    short_percent=float(d["top_position_short_percent"]),
+                    ratio=float(d["top_position_long_short_ratio"]),
+                )
+                for d in data
+            ]
+            all_bars.extend(bars)
+
+            if len(data) < self.MAX_LIMIT:
+                break
+            current_end = int(bars[0].timestamp.replace(tzinfo=timezone.utc).timestamp()) - 1
+            if start_time is not None and current_end < start_time:
+                break
+
+        seen = set()
+        unique = []
+        for b in all_bars:
+            if b.timestamp not in seen:
+                seen.add(b.timestamp)
+                unique.append(b)
+        unique.sort(key=lambda b: b.timestamp)
+        return unique
+
+    def fetch_cvd_history(
+        self,
+        symbol: str = "BTC",
+        exchange_list: str = "Binance",
+        interval: str = "4h",
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[CVDBar]:
+        """Fetch aggregated CVD (Cumulative Volume Delta) history."""
+        all_bars: list[CVDBar] = []
+        current_end = end_time
+
+        while True:
+            params = {
+                "symbol": symbol,
+                "exchange_list": exchange_list,
+                "interval": interval,
+                "limit": self.MAX_LIMIT,
+            }
+            if start_time is not None:
+                params["startTime"] = start_time
+            if current_end is not None:
+                params["endTime"] = current_end
+
+            data = self._get_json("/api/futures/aggregated-cvd/history", params)
+            if not data:
+                break
+
+            bars = [
+                CVDBar(
+                    timestamp=datetime.fromtimestamp(d["time"] / 1000, tz=timezone.utc).replace(tzinfo=None),
+                    buy_vol=float(d["agg_taker_buy_vol"]),
+                    sell_vol=float(d["agg_taker_sell_vol"]),
+                    cvd=float(d["cum_vol_delta"]),
+                )
+                for d in data
+            ]
+            all_bars.extend(bars)
+
+            if len(data) < self.MAX_LIMIT:
+                break
+            current_end = int(bars[0].timestamp.replace(tzinfo=timezone.utc).timestamp()) - 1
+            if start_time is not None and current_end < start_time:
+                break
+
+        seen = set()
+        unique = []
+        for b in all_bars:
+            if b.timestamp not in seen:
+                seen.add(b.timestamp)
+                unique.append(b)
+        unique.sort(key=lambda b: b.timestamp)
+        return unique
+
+    # Basis endpoint returns 500 with limit>1000
+    _BASIS_MAX_LIMIT = 1000
+
+    def fetch_basis_history(
+        self,
+        exchange: str = "Binance",
+        symbol: str = "BTCUSDT",
+        interval: str = "4h",
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[BasisBar]:
+        """Fetch futures basis (premium) history."""
+        all_bars: list[BasisBar] = []
+        current_end = end_time
+
+        while True:
+            params = {
+                "exchange": exchange,
+                "symbol": symbol,
+                "interval": interval,
+                "limit": self._BASIS_MAX_LIMIT,
+            }
+            if start_time is not None:
+                params["startTime"] = start_time
+            if current_end is not None:
+                params["endTime"] = current_end
+
+            data = self._get_json("/api/futures/basis/history", params)
+            if not data:
+                break
+
+            bars = [
+                BasisBar(
+                    timestamp=datetime.fromtimestamp(d["time"] / 1000, tz=timezone.utc).replace(tzinfo=None),
+                    open_basis=float(d["open_basis"]),
+                    close_basis=float(d["close_basis"]),
+                )
+                for d in data
+            ]
+            all_bars.extend(bars)
+
+            if len(data) < self._BASIS_MAX_LIMIT:
+                break
+            current_end = int(bars[0].timestamp.replace(tzinfo=timezone.utc).timestamp()) - 1
+            if start_time is not None and current_end < start_time:
+                break
+
+        seen = set()
+        unique = []
+        for b in all_bars:
+            if b.timestamp not in seen:
+                seen.add(b.timestamp)
+                unique.append(b)
+        unique.sort(key=lambda b: b.timestamp)
+        return unique
+
+    MAX_RETRIES = 3
+
+    def _get_json(self, path: str, params: dict | None = None) -> list | dict:
+        """Make a rate-limited GET request with retry on rate limit."""
         query_parts = []
         for k, v in (params or {}).items():
             query_parts.append(f"{k}={v}")
@@ -278,15 +468,29 @@ class CoinglassClient:
         if query:
             url = f"{url}?{query}"
 
-        req = Request(url, method="GET")
-        req.add_header("CG-API-KEY", self._api_key)
-        req.add_header("Accept", "application/json")
+        for attempt in range(self.MAX_RETRIES):
+            # Rate limiting
+            elapsed = time.time() - self._last_request_time
+            if elapsed < self.MIN_REQUEST_INTERVAL:
+                time.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
 
-        self._last_request_time = time.time()
-        with urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+            req = Request(url, method="GET")
+            req.add_header("CG-API-KEY", self._api_key)
+            req.add_header("Accept", "application/json")
 
-        if result.get("code") != "0":
-            raise RuntimeError(f"Coinglass API error: {result.get('msg', 'unknown')}")
+            self._last_request_time = time.time()
+            with urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
 
-        return result.get("data", [])
+            if result.get("code") == "0":
+                return result.get("data", [])
+
+            msg = result.get("msg", "unknown")
+            if "Too Many Requests" in msg and attempt < self.MAX_RETRIES - 1:
+                wait = (attempt + 1) * 5  # back off: 5s, 10s
+                time.sleep(wait)
+                continue
+
+            raise RuntimeError(f"Coinglass API error: {msg}")
+
+        return []

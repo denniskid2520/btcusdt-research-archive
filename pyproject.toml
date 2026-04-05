@@ -24,3 +24,4 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
+norecursedirs = ["_deprecated"]

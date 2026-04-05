@@ -47,7 +47,7 @@ def _base_config(**overrides) -> TrendBreakoutConfig:
         min_r_squared=0.0,
         min_stop_atr_multiplier=1.5,
         time_stop_bars=84,
-        use_narrative_regime=False,
+
         enable_ascending_channel_resistance_rejection=False,
         enable_descending_channel_breakout_long=False,
         enable_ascending_channel_breakdown_short=False,

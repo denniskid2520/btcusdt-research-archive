@@ -30,6 +30,9 @@ class FuturesSnapshot:
     liq_short_usd: float | None = None  # Short liquidation volume
     taker_buy_usd: float | None = None  # Taker buy volume
     taker_sell_usd: float | None = None  # Taker sell volume
+    top_ls_ratio: float | None = None  # Top trader position L/S ratio
+    cvd: float | None = None  # Cumulative Volume Delta
+    basis: float | None = None  # Futures basis (premium)
 
     @property
     def long_pct(self) -> float:
@@ -69,38 +72,33 @@ class StaticFuturesProvider(FuturesDataProvider):
         funding_csv: str | Path | None = None,
         liquidation_csv: str | Path | None = None,
         taker_csv: str | Path | None = None,
+        top_ls_csv: str | Path | None = None,
+        cvd_csv: str | Path | None = None,
+        basis_csv: str | Path | None = None,
     ) -> "StaticFuturesProvider":
         """Build provider from Coinglass CSV files, merging by timestamp."""
-        oi_by_ts: dict[datetime, dict] = {}
-        funding_by_ts: dict[datetime, dict] = {}
-        liq_by_ts: dict[datetime, dict] = {}
-        taker_by_ts: dict[datetime, dict] = {}
 
-        if oi_csv and Path(oi_csv).exists():
-            with open(oi_csv) as f:
-                for row in csv.DictReader(f):
-                    ts = datetime.fromisoformat(row["timestamp"])
-                    oi_by_ts[ts] = row
+        def _load_csv(path: str | Path | None) -> dict[datetime, dict]:
+            result: dict[datetime, dict] = {}
+            if path and Path(path).exists():
+                with open(path) as f:
+                    for row in csv.DictReader(f):
+                        ts = datetime.fromisoformat(row["timestamp"])
+                        result[ts] = row
+            return result
 
-        if funding_csv and Path(funding_csv).exists():
-            with open(funding_csv) as f:
-                for row in csv.DictReader(f):
-                    ts = datetime.fromisoformat(row["timestamp"])
-                    funding_by_ts[ts] = row
+        oi_by_ts = _load_csv(oi_csv)
+        funding_by_ts = _load_csv(funding_csv)
+        liq_by_ts = _load_csv(liquidation_csv)
+        taker_by_ts = _load_csv(taker_csv)
+        top_ls_by_ts = _load_csv(top_ls_csv)
+        cvd_by_ts = _load_csv(cvd_csv)
+        basis_by_ts = _load_csv(basis_csv)
 
-        if liquidation_csv and Path(liquidation_csv).exists():
-            with open(liquidation_csv) as f:
-                for row in csv.DictReader(f):
-                    ts = datetime.fromisoformat(row["timestamp"])
-                    liq_by_ts[ts] = row
-
-        if taker_csv and Path(taker_csv).exists():
-            with open(taker_csv) as f:
-                for row in csv.DictReader(f):
-                    ts = datetime.fromisoformat(row["timestamp"])
-                    taker_by_ts[ts] = row
-
-        all_timestamps = set(oi_by_ts) | set(funding_by_ts) | set(liq_by_ts) | set(taker_by_ts)
+        all_timestamps = (
+            set(oi_by_ts) | set(funding_by_ts) | set(liq_by_ts)
+            | set(taker_by_ts) | set(top_ls_by_ts) | set(cvd_by_ts) | set(basis_by_ts)
+        )
         data: dict[datetime, FuturesSnapshot] = {}
 
         for ts in all_timestamps:
@@ -108,6 +106,9 @@ class StaticFuturesProvider(FuturesDataProvider):
             fund = funding_by_ts.get(ts)
             liq = liq_by_ts.get(ts)
             taker = taker_by_ts.get(ts)
+            top_ls = top_ls_by_ts.get(ts)
+            cvd = cvd_by_ts.get(ts)
+            basis = basis_by_ts.get(ts)
 
             data[ts] = FuturesSnapshot(
                 timestamp=ts,
@@ -120,6 +121,9 @@ class StaticFuturesProvider(FuturesDataProvider):
                 liq_short_usd=float(liq["short_usd"]) if liq else None,
                 taker_buy_usd=float(taker["buy_usd"]) if taker else None,
                 taker_sell_usd=float(taker["sell_usd"]) if taker else None,
+                top_ls_ratio=float(top_ls["ratio"]) if top_ls else None,
+                cvd=float(cvd["cvd"]) if cvd else None,
+                basis=float(basis["close_basis"]) if basis else None,
             )
 
         return cls(data)
