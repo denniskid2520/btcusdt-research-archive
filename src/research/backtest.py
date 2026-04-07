@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -16,18 +17,20 @@ from research.macro_cycle import (
     MacroCycleConfig,
     MacroCycleRecord,
     aggregate_to_daily,
+    aggregate_to_weekly,
     check_daily_rsi_buy,
     check_daily_rsi_buy_native,
     check_daily_rsi_sell,
     check_daily_rsi_sell_native,
     check_weekly_rsi_buy,
     check_weekly_rsi_buy_native,
+    compute_macd,
     detect_cycle_signal,
     get_monthly_rsi,
     get_monthly_rsi_native,
-    macd_momentum_hold,
 )
 from research.daily_flag import detect_daily_flag
+from strategies.channel_detector import ChannelDetector, DailyIndicators
 from strategies.trend_breakout import (
     RULE_NAMES,
     StrategyEvaluation,
@@ -55,6 +58,7 @@ class TradeRecord:
     exit_fee: float
     pnl: float
     return_pct: float
+    metadata: dict[str, Any] | None = None  # stop_price, target, trailing_atr, confidence
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,7 @@ def run_backtest(
     futures_provider: Any | None = None,
     mtf_bars: Any | None = None,
     macro_cycle: MacroCycleConfig | None = None,
+    channel_quality_min_score: int = 0,
 ) -> BacktestResult:
     if len(bars) < 2:
         raise ValueError("Backtest requires at least two bars.")
@@ -156,6 +161,12 @@ def run_backtest(
     rule_eval_counts: dict[str, int] = {name: 0 for name in RULE_NAMES}
     event_markers: list[dict[str, Any]] = []
     time_stop_bars = getattr(getattr(strategy, "config", None), "time_stop_bars", None)
+    _loss_cooldown_count = getattr(_cfg, "loss_cooldown_count", 0)
+    _loss_cooldown_bars = getattr(_cfg, "loss_cooldown_bars", 24)
+    consecutive_losses: int = 0
+    cooldown_until: int = -1  # bar index until which entries are blocked
+    _bear_reversal_enabled = getattr(_cfg, "bear_reversal_enabled", False)
+    _bear_reversal_last_bar: int = -9999  # one-shot: cooldown after trigger
 
     # ── Native 1d/1w bars: use Binance candles directly for RSI ──
     _has_native = (
@@ -167,6 +178,7 @@ def run_backtest(
     _native_1w = mtf_bars._data["1w"] if _has_native else None
     _native_1d_ts = [b.timestamp for b in _native_1d] if _native_1d else []
     _native_1w_ts = [b.timestamp for b in _native_1w] if _native_1w else []
+    _accel_zone = False  # persists between bars; updated every 6th bar
 
     for index in range(1, len(bars)):
         history = bars[: index + 1]
@@ -179,44 +191,84 @@ def run_backtest(
         if position.is_open and hasattr(broker, "check_liquidation"):
             if broker.check_liquidation(symbol, current_bar.low if position.side == "long" else current_bar.high, current_bar.timestamp):
                 entry_info = open_entries.pop(symbol, {})
+                _liq_side = entry_info.get("side", position.side)
+                if _liq_side == "buy":
+                    _liq_side = "long"
+                _liq_entry_fee = entry_info.get("entry_fee", 0)
                 trades.append(TradeRecord(
-                    symbol=symbol, side=entry_info.get("side", position.side),
-                    entry_rule=entry_info.get("reason", "unknown"),
+                    symbol=symbol, side=_liq_side,
+                    entry_rule=entry_info.get("entry_rule", "unknown"),
                     exit_reason="liquidation",
                     entry_time=entry_info.get("entry_time", current_bar.timestamp),
                     exit_time=current_bar.timestamp,
                     entry_price=entry_info.get("entry_price", 0),
                     exit_price=current_bar.low if position.side == "long" else current_bar.high,
                     quantity=position.quantity,
-                    entry_fee=entry_info.get("entry_fee", 0),
+                    entry_fee=_liq_entry_fee,
                     exit_fee=0,
-                    pnl=-position.reserved_margin,
+                    pnl=-position.reserved_margin - _liq_entry_fee,
                     return_pct=-100.0,
+                    metadata={
+                        "stop_price": entry_info.get("stop_price"),
+                        "target_price": entry_info.get("target_price"),
+                        "trailing_stop_atr": entry_info.get("trailing_stop_atr", 0),
+                        "confidence": entry_info.get("confidence"),
+                    },
                 ))
+                # Liquidation is always a loss
+                consecutive_losses += 1
+                if _loss_cooldown_count > 0 and consecutive_losses >= _loss_cooldown_count:
+                    cooldown_until = index + _loss_cooldown_bars
                 position = broker.get_position(symbol)
 
         # Trailing stop: update best price and check stop
-        # MACD momentum guard: widen trailing stop when daily MACD confirms
-        # impulse direction — "不要輕易止盈" during strong momentum.
+        # ACCEL zone: weekly MACD death cross + daily MACD < 0 → widen trail 3x
+        if not (position.is_open and symbol in open_entries and open_entries[symbol].get("side") == "short"):
+            _accel_zone = False  # reset when not in a short position
         if position.is_open and symbol in open_entries:
             entry_info = open_entries[symbol]
             trail_atr = entry_info.get("trailing_stop_atr", 0)
             if trail_atr and trail_atr > 0:
                 atr = _compute_trailing_atr(bars[: index + 1], 14)
                 if atr > 0:
-                    # MACD guard: check every 6 bars (~1 day) to avoid overhead
-                    _macd_hold = False
-                    if index % 6 == 0 and len(bars[: index + 1]) > 240:
+                    # ── ACCEL zone: dual-timeframe MACD impulse detection ──
+                    # Weekly hist ≤ 0 (death cross) + Daily MACD < 0 (acceleration)
+                    # → widen trail 3x to ride the full crash impulse.
+                    # When daily MACD turns positive → reverts to 1x (deceleration).
+                    _accel_mult = getattr(_cfg, "accel_trail_multiplier", 3.0)
+                    if (
+                        entry_info["side"] == "short"
+                        and entry_info.get("trade_type") == "impulse"
+                        and index % 6 == 0
+                        and len(bars[: index + 1]) > 240
+                    ):
+                        # Daily MACD
                         if _native_1d is not None:
-                            from bisect import bisect_right as _br
-                            _di = _br(_native_1d_ts, current_bar.timestamp)
-                            _macd_daily = _native_1d[:_di]
+                            _ac_di = bisect_right(_native_1d_ts, current_bar.timestamp)
+                            _ac_d_bars = _native_1d[:_ac_di]
                         else:
-                            _macd_daily = aggregate_to_daily(bars[: index + 1])
-                        _side = "short" if entry_info["side"] == "short" else "long"
-                        _macd_hold = macd_momentum_hold(_macd_daily, _side)
-                    # When MACD confirms momentum, widen stop 2x
-                    effective_trail = trail_atr * 2.0 if _macd_hold else trail_atr
+                            _ac_d_bars = aggregate_to_daily(bars[: index + 1])
+                        _ac_d_macd, _, _ = compute_macd(_ac_d_bars)
+
+                        # Weekly MACD histogram
+                        if _native_1w is not None:
+                            _ac_wi = bisect_right(_native_1w_ts, current_bar.timestamp)
+                            _ac_w_bars = _native_1w[:_ac_wi]
+                        else:
+                            _ac_w_bars = aggregate_to_weekly(bars[: index + 1])
+                        _, _, _ac_w_hist = compute_macd(_ac_w_bars)
+
+                        _accel_zone = (
+                            _ac_w_hist is not None and _ac_w_hist <= 0
+                            and _ac_d_macd is not None and _ac_d_macd < 0
+                        )
+
+                    # Trail multiplier: ACCEL zone 3x, normal 1x
+                    if _accel_zone:
+                        effective_trail = trail_atr * _accel_mult
+                        entry_info["_accel_active_bars"] = entry_info.get("_accel_active_bars", 0) + 1
+                    else:
+                        effective_trail = trail_atr
 
                     if entry_info["side"] == "short":
                         entry_info["best_price"] = min(entry_info["best_price"], current_bar.low)
@@ -248,12 +300,21 @@ def run_backtest(
                     metadata={"reason": "time_stop"},
                 )
 
+        # ── Consecutive loss cooldown: skip entries when on tilt ──
+        _in_cooldown = (
+            _loss_cooldown_count > 0
+            and not position.is_open
+            and consecutive_losses >= _loss_cooldown_count
+            and index < cooldown_until
+        )
+
         # ── Daily flag overlay: bear flag breakdown / bull flag breakout ──
         # Check every 6 bars (~1 day) when no position is open.
         # Uses daily-scale channel detection (independent of 4h rules).
         if (
             order is None
             and not position.is_open
+            and not _in_cooldown
             and index % 6 == 0
             and index > 360  # need ~60 days of daily data
         ):
@@ -281,24 +342,24 @@ def run_backtest(
                 parent_trend=_parent_trend,
             )
             if flag_sig.action in {"short", "long"}:
-                # MACD momentum filter (research-driven):
-                # SHORT: only when daily MACD >= 0 (death cross from positive
-                # = fresh impulse). MACD < 0 = momentum already spent → skip.
-                # LONG: no MACD filter (indicator difference was not significant).
-                _macd_ok = True
-                if flag_sig.action == "short" and len(bars[: index + 1]) > 240:
-                    from research.macro_cycle import compute_macd
-                    if _native_1d is not None:
-                        from bisect import bisect_right as _br2
-                        _di2 = _br2(_native_1d_ts, current_bar.timestamp)
-                        _d_bars = _native_1d[:_di2]
+                # Bear flag weekly RSI guard: block bear flag shorts in bull market
+                _bf_ok = True
+                _bf_max_wrsi = getattr(getattr(strategy, "config", None), "bear_flag_max_weekly_rsi", 0.0)
+                if (
+                    flag_sig.action == "short"
+                    and _bf_max_wrsi > 0
+                    and len(bars[: index + 1]) > 240
+                ):
+                    from research.macro_cycle import compute_weekly_rsi
+                    if _native_1w is not None:
+                        _wi_bf = bisect_right(_native_1w_ts, current_bar.timestamp)
+                        _bf_wrsi = compute_weekly_rsi(_native_1w[:_wi_bf])
                     else:
-                        _d_bars = aggregate_to_daily(bars[: index + 1])
-                    _m_line, _, _ = compute_macd(_d_bars)
-                    if _m_line is not None and _m_line < 0:
-                        _macd_ok = False  # MACD negative = impulse exhausted
+                        _bf_wrsi = compute_weekly_rsi(aggregate_to_weekly(bars[: index + 1]))
+                    if _bf_wrsi is not None and _bf_wrsi > _bf_max_wrsi:
+                        _bf_ok = False  # bull market: bear flag unreliable
 
-                if _macd_ok:
+                if _bf_ok:
                     _flag_trail_atr = getattr(getattr(strategy, "config", None), "impulse_trailing_stop_atr", 6.0) or 6.0
                     _daily_flag_signal = StrategySignal(
                         action=flag_sig.action,
@@ -306,15 +367,53 @@ def run_backtest(
                         reason=f"daily_{flag_sig.flag_type}",
                         stop_price=flag_sig.resistance if flag_sig.action == "short" else flag_sig.support,
                         target_price=None,
-                        metadata={"trailing_stop_atr": _flag_trail_atr},
+                        metadata={"trailing_stop_atr": _flag_trail_atr, "trade_type": "impulse"},
                     )
 
-        if order is None:
+        # ── Bear reversal combo: daily VP-based bottom detection ──
+        # Independent of 4h channel rules. One-shot: 540 bar cooldown (~90 days) after trigger.
+        _bear_reversal_signal: StrategySignal | None = None
+        if (
+            order is None
+            and not position.is_open
+            and not _in_cooldown
+            and _bear_reversal_enabled
+            and index % 6 == 0
+            and index > 1500  # need 250+ daily bars (~1500 4h bars)
+            and index - _bear_reversal_last_bar > 540  # 90-day cooldown between signals
+        ):
+            if _native_1d is not None:
+                _di_br = bisect_right(_native_1d_ts, current_bar.timestamp)
+                _br_daily = _native_1d[:_di_br]
+            else:
+                _br_daily = aggregate_to_daily(bars[: index + 1])
+            if len(_br_daily) >= 250:
+                from indicators.volume_profile import detect_bear_reversal_phase
+                # Only pass last 300 daily bars so old events expire naturally
+                _br_phase = detect_bear_reversal_phase(_br_daily[-300:])
+                if _br_phase.action == "buy":
+                    _bear_reversal_signal = StrategySignal(
+                        action="buy",
+                        confidence=_br_phase.confidence,
+                        reason="bear_reversal_combo",
+                        stop_price=_br_phase.stop_price,
+                        target_price=None,
+                        metadata={
+                            "trailing_stop_atr": getattr(_cfg, "impulse_trailing_stop_atr", 6.0) or 6.0,
+                            **_br_phase.metadata,
+                        },
+                    )
+                    _bear_reversal_last_bar = index  # one-shot: prevent re-trigger for 540 bars
+
+        if order is None and not _in_cooldown:
             signal, evaluation = _evaluate_strategy(strategy=strategy, symbol=symbol, history=history, position=position, futures_provider=futures_provider, mtf_bars=mtf_bars)
 
             # Daily flag overrides 4h hold signal (flag is higher priority)
             if signal.action == "hold" and _daily_flag_signal is not None:
                 signal = _daily_flag_signal
+            # Bear reversal combo: only if no other signal
+            if signal.action == "hold" and _bear_reversal_signal is not None:
+                signal = _bear_reversal_signal
             if evaluation is not None:
                 for item in evaluation.rule_evaluations:
                     rule_eval_counts[item.rule_name] = rule_eval_counts.get(item.rule_name, 0) + 1
@@ -329,6 +428,46 @@ def run_backtest(
                             event_markers.append(marker)
             elif signal.action in {"buy", "short"} and signal.reason:
                 signal_counts[signal.reason] = signal_counts.get(signal.reason, 0) + 1
+
+            # ── Channel quality gate: ★★★ indicator filter for ALL channel rules ──
+            # SHORT channel signals → score_high_pivot (★★★ HIGH conditions)
+            # LONG channel signals → score_low_pivot (★★★ LOW conditions)
+            if (
+                signal.action in {"buy", "short"}
+                and channel_quality_min_score > 0
+                and futures_provider is not None
+                and signal.reason
+                and "channel" in signal.reason
+            ):
+                signal = _channel_quality_gate(
+                    signal, current_bar, futures_provider,
+                    bars[: index + 1], channel_quality_min_score,
+                )
+
+            # ── Weekly MACD death cross gate: block ALL shorts in bull trend ──
+            # 週線 MACD 金叉 (histogram > 0) = 牛市 → 阻擋做空
+            # 週線 MACD 死叉 (histogram <= 0) = 熊市 → 做空放行
+            _weekly_macd_gate = getattr(_cfg, "weekly_macd_short_gate", False)
+            if signal.action == "short" and _weekly_macd_gate and index > 240:
+                if _native_1w is not None:
+                    _wi_mg = bisect_right(_native_1w_ts, current_bar.timestamp)
+                    _wm_bars = _native_1w[:_wi_mg]
+                else:
+                    _wm_bars = aggregate_to_weekly(bars[: index + 1])
+                _, _, _wm_hist = compute_macd(_wm_bars)
+                if _wm_hist is not None and _wm_hist > 0:
+                    signal = StrategySignal(
+                        action="hold", confidence=0,
+                        reason="weekly_macd_bullish_block",
+                    )
+
+            # ── ACCEL zone: block buy/long signals during impulse ──
+            # 週線死叉 + 日線MACD<0 = 加速下跌中 → 阻擋做多，等脈衝結束再放行
+            if _accel_zone and signal.action == "buy":
+                signal = StrategySignal(
+                    action="hold", confidence=0,
+                    reason="accel_zone_long_blocked",
+                )
 
             if signal.action in {"buy", "short"}:
                 stop_dist = 0.0
@@ -383,6 +522,8 @@ def run_backtest(
                     }
                     if signal.metadata and signal.metadata.get("trailing_stop_atr"):
                         entry_metadata["trailing_stop_atr"] = signal.metadata["trailing_stop_atr"]
+                    if signal.metadata and signal.metadata.get("trade_type"):
+                        entry_metadata["trade_type"] = signal.metadata["trade_type"]
                 order = OrderRequest(
                     symbol=symbol,
                     side=signal.action,
@@ -425,8 +566,12 @@ def run_backtest(
                             "entry_fee": fill.fee,
                             "entry_index": index,
                             "trailing_stop_atr": order.metadata.get("trailing_stop_atr", 0),
+                            "trade_type": order.metadata.get("trade_type", ""),
                             "best_price": fill.fill_price,
                             "scale_in_count": 0,
+                            "stop_price": order.metadata.get("stop_price"),
+                            "target_price": order.metadata.get("target_price"),
+                            "confidence": signal.confidence if order is not None else None,
                         }
                 elif fill.side in {"sell", "cover"} and fill.symbol in open_entries:
                     entry = open_entries.pop(fill.symbol)
@@ -437,6 +582,13 @@ def run_backtest(
                         contract_type=contract_type,
                     )
                     trades.append(trade_rec)
+                    # Consecutive loss cooldown tracking
+                    if trade_rec.pnl > 0:
+                        consecutive_losses = 0
+                    else:
+                        consecutive_losses += 1
+                        if _loss_cooldown_count > 0 and consecutive_losses >= _loss_cooldown_count:
+                            cooldown_until = index + _loss_cooldown_bars
                     # Impulse harvest: convert % of large-win profit BTC → USDT
                     if (
                         harvest_pct > 0
@@ -471,9 +623,8 @@ def run_backtest(
             # ── Layer 1: D+W RSI sell (D>=75 + W>=70 + M>=65 guard) ──
             if index % 6 == 0 and index > 180:  # need ~30 daily bars
                 if _has_native:
-                    from bisect import bisect_right as _brs
-                    _di_s = _brs(_native_1d_ts, current_bar.timestamp)
-                    _wi_s = _brs(_native_1w_ts, current_bar.timestamp)
+                    _di_s = bisect_right(_native_1d_ts, current_bar.timestamp)
+                    _wi_s = bisect_right(_native_1w_ts, current_bar.timestamp)
                     _d_sell, _d_rsi, _w_rsi = check_daily_rsi_sell_native(
                         _native_1d[:_di_s], _native_1w[:_wi_s], macro_cycle,
                     )
@@ -532,8 +683,7 @@ def run_backtest(
                 and not macro_weekly_bought
             ):
                 if _has_native:
-                    from bisect import bisect_right as _brw
-                    _wi_b = _brw(_native_1w_ts, current_bar.timestamp)
+                    _wi_b = bisect_right(_native_1w_ts, current_bar.timestamp)
                     _w_buy, _w_rsi_buy = check_weekly_rsi_buy_native(
                         _native_1w[:_wi_b], macro_cycle,
                     )
@@ -566,8 +716,7 @@ def run_backtest(
             # Reset weekly buy flag when RSI recovers above 50
             if macro_weekly_bought and index % 42 == 0:
                 if _has_native:
-                    from bisect import bisect_right as _brr
-                    _wi_r = _brr(_native_1w_ts, current_bar.timestamp)
+                    _wi_r = bisect_right(_native_1w_ts, current_bar.timestamp)
                     _, _w_chk = check_weekly_rsi_buy_native(
                         _native_1w[:_wi_r], macro_cycle,
                     )
@@ -583,11 +732,12 @@ def run_backtest(
             #   track lowest price seen.
             # Phase 2 (CONFIRM): price bounces >= 5% from lowest -> BUY.
             #   Buys 20% of USDT reserves. One buy per cycle.
-            if index % 6 == 0 and index > 180 and usdt_reserves > 0:
+            # NOTE: RSI computation + reset MUST run even when usdt_reserves == 0,
+            # otherwise dw_buy_armed/dw_buy_done flags never reset.
+            if index % 6 == 0 and index > 180:
                 if _has_native:
-                    from bisect import bisect_right as _brb
-                    _di_b = _brb(_native_1d_ts, current_bar.timestamp)
-                    _wi_b2 = _brb(_native_1w_ts, current_bar.timestamp)
+                    _di_b = bisect_right(_native_1d_ts, current_bar.timestamp)
+                    _wi_b2 = bisect_right(_native_1w_ts, current_bar.timestamp)
                     _db_buy, _db_rsi, _db_wrsi = check_daily_rsi_buy_native(
                         _native_1d[:_di_b], _native_1w[:_wi_b2], macro_cycle,
                     )
@@ -606,7 +756,7 @@ def run_backtest(
                     dw_buy_low_price = current_bar.close
 
                 # CONFIRM: price bounced from low -> bottom confirmed
-                if dw_buy_armed and not dw_buy_done:
+                if dw_buy_armed and not dw_buy_done and usdt_reserves > 0:
                     _bounce = (current_bar.close - dw_buy_low_price) / dw_buy_low_price
                     if _bounce >= macro_cycle.dw_buy_bounce_pct:
                         usdt_to_spend = usdt_reserves * macro_cycle.daily_rsi_buy_pct
@@ -650,9 +800,8 @@ def run_backtest(
                         _funding = getattr(_snap, "funding_rate", None)
                         _top_ls = getattr(_snap, "top_ls_ratio", None)
                 if _has_native:
-                    from bisect import bisect_right as _brd
-                    _di_d = _brd(_native_1d_ts, current_bar.timestamp)
-                    _wi_d = _brd(_native_1w_ts, current_bar.timestamp)
+                    _di_d = bisect_right(_native_1d_ts, current_bar.timestamp)
+                    _wi_d = bisect_right(_native_1w_ts, current_bar.timestamp)
                     cycle_sig = detect_cycle_signal(
                         bars[: index + 1], macro_cycle,
                         funding_rate=_funding, top_ls_ratio=_top_ls,
@@ -845,6 +994,85 @@ def build_default_strategy() -> TrendBreakoutStrategy:
     )
 
 
+def _channel_quality_gate(
+    signal: StrategySignal,
+    current_bar: MarketBar,
+    futures_provider: Any,
+    history: list[MarketBar],
+    min_score: int,
+) -> StrategySignal:
+    """Block channel signals when ★★★ indicator quality is too low.
+
+    Scores the current bar's Coinglass indicators against the empirically
+    derived conditions from the 6-channel analysis:
+      SHORT → score_high_pivot (7 ★★★ HIGH conditions)
+      LONG  → score_low_pivot  (9 ★★★ LOW conditions, includes RSI 3/7/14)
+    If the score is below *min_score*, signal is downgraded to hold.
+    """
+    snap = futures_provider.get_snapshot("", current_bar.timestamp)
+    if snap is None:
+        return signal  # no data → pass through (don't block)
+
+    # Compute RSI(3,7,14) from price history for ★★★ LOW conditions
+    _rsi3 = _rsi7 = _rsi14 = 50.0
+    if len(history) >= 15:
+        _closes = [b.close for b in history[-60:]]
+        from indicators.volume_profile import _rsi_from_closes
+        r3 = _rsi_from_closes(_closes, 3)
+        r7 = _rsi_from_closes(_closes, 7)
+        r14 = _rsi_from_closes(_closes, 14)
+        if r3 is not None:
+            _rsi3 = r3
+        if r7 is not None:
+            _rsi7 = r7
+        if r14 is not None:
+            _rsi14 = r14
+
+    # Build DailyIndicators from the FuturesSnapshot
+    ind = DailyIndicators(
+        oi=snap.oi_close or 0.0,
+        funding_pct=snap.funding_rate or 0.0,
+        ls_ratio=snap.top_ls_ratio or 0.0,
+        long_liq_usd=snap.liq_long_usd or 0.0,
+        short_liq_usd=snap.liq_short_usd or 0.0,
+        cvd=snap.cvd or 0.0,
+        taker_buy_usd=snap.taker_buy_usd or 0.0,
+        taker_sell_usd=snap.taker_sell_usd or 0.0,
+        rsi3=_rsi3,
+        rsi7=_rsi7,
+        rsi14=_rsi14,
+    )
+
+    # Previous day's indicators (for OI/CVD delta)
+    prev_ind = None
+    if len(history) >= 7:
+        prev_snap = futures_provider.get_snapshot("", history[-7].timestamp)
+        if prev_snap is not None:
+            prev_ind = DailyIndicators(
+                oi=prev_snap.oi_close or 0.0,
+                cvd=prev_snap.cvd or 0.0,
+            )
+
+    detector = ChannelDetector()
+
+    if signal.action == "short":
+        score = detector.score_high_pivot(ind, prev_ind)
+        if score < min_score:
+            return StrategySignal(
+                action="hold", confidence=0.0,
+                reason=f"channel_quality_high_{score}_lt_{min_score}",
+            )
+    elif signal.action == "buy":
+        score = detector.score_low_pivot(ind, prev_ind)
+        if score < min_score:
+            return StrategySignal(
+                action="hold", confidence=0.0,
+                reason=f"channel_quality_low_{score}_lt_{min_score}",
+            )
+
+    return signal
+
+
 def build_baseline_strategy() -> TrendBreakoutStrategy:
     return TrendBreakoutStrategy(
         TrendBreakoutConfig(
@@ -1001,6 +1229,12 @@ def _build_trade_record(
         exit_fee=exit_fill.fee,
         pnl=pnl,
         return_pct=return_pct,
+        metadata={
+            "stop_price": entry.get("stop_price"),
+            "target_price": entry.get("target_price"),
+            "trailing_stop_atr": entry.get("trailing_stop_atr", 0),
+            "confidence": entry.get("confidence"),
+        },
     )
 
 

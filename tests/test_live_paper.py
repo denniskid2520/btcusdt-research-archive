@@ -85,8 +85,8 @@ def test_live_paper_replay_generates_trades_on_real_data() -> None:
     """Replay real 4H data through the runner — should produce trades."""
     from data.backfill import load_bars_from_csv
 
-    all_bars = load_bars_from_csv("src/data/btcusdt_4h_real.csv")
-    # Use bars from index 500 onward (mid-2024, known to have trade setups)
+    all_bars = load_bars_from_csv("src/data/btcusdt_4h_5year.csv")
+    # Use bars from index 500 onward (known to have trade setups)
     bars = all_bars[500:]
     adapter = ReplayAdapter(bars)
     runner = LivePaperRunner(

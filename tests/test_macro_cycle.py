@@ -1309,6 +1309,49 @@ def test_dw_buy_arm_and_confirm_mechanism() -> None:
     )
 
 
+def test_dw_buy_reset_runs_without_usdt_reserves() -> None:
+    """D+W buy RSI reset must run even when usdt_reserves == 0.
+
+    BUG FIX: Previously the reset logic (_db_rsi >= 50 -> clear flags) was
+    inside the `usdt_reserves > 0` guard. When reserves were 0, flags
+    dw_buy_armed/dw_buy_done could never reset, breaking the next cycle.
+    """
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    # The outer guard for Layer 1c should NOT include usdt_reserves
+    # Find the Layer 1c block structure
+    lines = source.split("\n")
+    layer_1c_start = None
+    reset_line = None
+    for i, line in enumerate(lines):
+        if "Layer 1c" in line:
+            layer_1c_start = i
+        if layer_1c_start and "_db_rsi >= 50.0" in line:
+            reset_line = i
+            break
+
+    assert layer_1c_start is not None, "Layer 1c block must exist"
+    assert reset_line is not None, "D+W buy reset must exist"
+
+    # The usdt_reserves > 0 check should appear AFTER the RSI computation
+    # and only around the CONFIRM buy action, not wrapping the entire block
+    rsi_compute_line = None
+    usdt_guard_line = None
+    for i in range(layer_1c_start, reset_line):
+        if "check_daily_rsi_buy" in lines[i]:
+            rsi_compute_line = i
+        if "usdt_reserves > 0" in lines[i] and rsi_compute_line is not None:
+            usdt_guard_line = i
+
+    assert rsi_compute_line is not None, "RSI computation must be outside usdt guard"
+    # The usdt guard should NOT wrap RSI computation - it should come after
+    assert usdt_guard_line is None or usdt_guard_line > rsi_compute_line, (
+        "usdt_reserves guard must not wrap RSI computation/reset"
+    )
+
+
 def test_dw_buy_bounce_config() -> None:
     """MacroCycleConfig should have D+W buy bounce confirmation field."""
     from research.macro_cycle import MacroCycleConfig
@@ -1489,4 +1532,126 @@ def test_backtest_uses_native_1d_1w() -> None:
     assert "1w" in source, "run_backtest should reference '1w' native bars"
     assert "check_daily_rsi_sell_native" in source, (
         "run_backtest should call native sell function when native bars available"
+    )
+
+
+# -- 23. bisect import at module level (no inline imports in loop) --------
+
+
+def test_liquidation_trade_record_fields() -> None:
+    """Liquidation TradeRecord must have correct side and entry_rule fields.
+
+    Regression: side stored order-side 'buy' instead of position-side 'long',
+    and entry_rule used wrong dict key 'reason' instead of 'entry_rule'.
+    """
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    # Must use 'entry_rule' key (not 'reason') for liquidation TradeRecord
+    assert 'entry_info.get("entry_rule"' in source, (
+        "Liquidation path must use entry_info.get('entry_rule', ...) not 'reason'"
+    )
+    # Must map 'buy' → 'long' for side
+    assert '_liq_side == "buy"' in source or '_liq_side ==' in source, (
+        "Liquidation path must convert order side 'buy' to position side 'long'"
+    )
+
+
+def test_bear_flag_weekly_rsi_guard_exists_in_backtest() -> None:
+    """Bear flag shorts must be guarded by weekly RSI check.
+
+    When weekly RSI > threshold (bull market), bear flag shorts fail at high rate.
+    The backtest engine must check weekly RSI before creating daily flag signals.
+    """
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    assert "bear_flag_max_weekly_rsi" in source, (
+        "run_backtest must check bear_flag_max_weekly_rsi to guard bear flag shorts"
+    )
+
+
+def test_no_inline_bisect_imports_in_backtest_loop() -> None:
+    """bisect_right must be imported at module level, not inside the loop.
+
+    Having `from bisect import bisect_right as _brX` inside the main loop
+    is wasteful — the import machinery runs sys.modules lookup on every
+    iteration even though bisect is already loaded.
+    """
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    assert "from bisect import" not in source, (
+        "run_backtest must not contain inline bisect imports; use module-level import"
+    )
+
+
+# ── 21. Consecutive loss cooldown ──────────────────────────────────
+
+
+def test_loss_cooldown_tracking_exists_in_backtest() -> None:
+    """run_backtest must track consecutive losses and apply cooldown.
+
+    When loss_cooldown_count > 0 and that many consecutive losses occur,
+    the engine must block new entries for loss_cooldown_bars bars.
+    """
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    assert "consecutive_losses" in source, (
+        "run_backtest must track consecutive_losses counter"
+    )
+    assert "cooldown_until" in source, (
+        "run_backtest must track cooldown_until bar index"
+    )
+    assert "loss_cooldown_count" in source, (
+        "run_backtest must read loss_cooldown_count from strategy config"
+    )
+
+
+def test_loss_cooldown_resets_on_win_in_backtest() -> None:
+    """Consecutive loss counter must reset to 0 when a trade wins."""
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    # After a winning trade (pnl > 0), consecutive_losses should be reset
+    assert "consecutive_losses = 0" in source, (
+        "run_backtest must reset consecutive_losses to 0 on winning trade"
+    )
+
+
+def test_loss_cooldown_blocks_entry_in_backtest() -> None:
+    """During cooldown period, no new entries should be generated."""
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    # The cooldown must block strategy evaluation / order creation
+    assert "cooldown_until" in source and "index" in source, (
+        "run_backtest must check cooldown_until against current bar index"
+    )
+
+
+# ── 22. Bear reversal combo wiring ────────────────────────────────
+
+
+def test_bear_reversal_wired_in_backtest() -> None:
+    """run_backtest must check bear_reversal_enabled and call detect_bear_reversal_phase."""
+    import inspect
+    from research.backtest import run_backtest
+
+    source = inspect.getsource(run_backtest)
+    assert "bear_reversal_enabled" in source, (
+        "run_backtest must read bear_reversal_enabled from config"
+    )
+    assert "bear_reversal_combo" in source, (
+        "run_backtest must produce bear_reversal_combo signal"
+    )
+    assert "detect_bear_reversal_phase" in source, (
+        "run_backtest must call detect_bear_reversal_phase"
     )

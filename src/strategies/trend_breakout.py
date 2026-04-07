@@ -110,6 +110,18 @@ class TrendBreakoutConfig:
     oi_divergence_threshold: float = -0.03  # OI change% below this = "falling" (e.g., -3%)
     top_ls_contrarian: bool = False  # block longs when top traders too long (contrarian)
     top_ls_threshold: float = 1.5  # L/S ratio above this = too crowded long
+    liq_cascade_filter: bool = False  # block entry when same-side liquidation spikes
+    liq_cascade_threshold: float = 5e7  # USD liquidation volume to trigger (default $50M)
+    taker_imbalance_filter: bool = False  # require taker flow in trade direction
+    taker_imbalance_threshold: float = 1.3  # buy/sell ratio needed for longs (inverse for shorts)
+    cvd_divergence_filter: bool = False  # block when CVD diverges from price direction
+    cvd_divergence_lookback: int = 6  # bars to compare CVD trend
+    weekly_macd_short_gate: bool = False  # Block ALL shorts when weekly MACD golden cross (bullish)
+    accel_trail_multiplier: float = 1.0  # ACCEL zone (W-hist<=0 + D-MACD<0): trail x N, block buys
+    bear_flag_max_weekly_rsi: float = 0.0  # 0=disabled. Block bear flag shorts when W-RSI > this
+    loss_cooldown_count: int = 0  # 0=disabled. Block entries after N consecutive losses
+    loss_cooldown_bars: int = 24  # bars to skip after hitting cooldown (24 = 4 days of 4h)
+    bear_reversal_enabled: bool = False  # daily VP bear bottom reversal combo (Rule #11)
 
     # ── Multi-timeframe entry/stop refinement ─────────────────────
     mtf_entry_confirmation: bool = False  # require 1h rejection wick to confirm entry
@@ -352,6 +364,80 @@ class TrendBreakoutStrategy(Strategy):
                         winning_signal = StrategySignal(
                             action="hold", confidence=0.0, reason="top_ls_too_crowded",
                         )
+
+        # Liquidation cascade filter: block entry when same-side liq spikes
+        if (
+            winning_signal.action != "hold"
+            and futures_provider is not None
+            and self.config.liq_cascade_filter
+        ):
+            snap = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
+            if snap is not None:
+                if winning_signal.action == "buy" and snap.liq_long_usd is not None:
+                    if snap.liq_long_usd >= self.config.liq_cascade_threshold:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="liq_cascade_blocked",
+                        )
+                elif winning_signal.action == "short" and snap.liq_short_usd is not None:
+                    if snap.liq_short_usd >= self.config.liq_cascade_threshold:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="liq_cascade_blocked",
+                        )
+
+        # Taker buy/sell imbalance filter: require flow in trade direction
+        if (
+            winning_signal.action != "hold"
+            and futures_provider is not None
+            and self.config.taker_imbalance_filter
+        ):
+            snap = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
+            if (
+                snap is not None
+                and snap.taker_buy_usd is not None
+                and snap.taker_sell_usd is not None
+                and snap.taker_sell_usd > 0
+                and snap.taker_buy_usd > 0
+            ):
+                if winning_signal.action == "buy":
+                    ratio = snap.taker_buy_usd / snap.taker_sell_usd
+                    if ratio < self.config.taker_imbalance_threshold:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="taker_imbalance_blocked",
+                        )
+                elif winning_signal.action == "short":
+                    ratio = snap.taker_sell_usd / snap.taker_buy_usd
+                    if ratio < self.config.taker_imbalance_threshold:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="taker_imbalance_blocked",
+                        )
+
+        # CVD divergence filter: price up + CVD down = exhausted buyers
+        if (
+            winning_signal.action != "hold"
+            and futures_provider is not None
+            and self.config.cvd_divergence_filter
+            and self.config.cvd_divergence_lookback > 0
+            and len(bars) > self.config.cvd_divergence_lookback
+        ):
+            lookback = self.config.cvd_divergence_lookback
+            current_snap = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
+            past_snap = futures_provider.get_snapshot(symbol, bars[-1 - lookback].timestamp)
+            if (
+                current_snap is not None
+                and past_snap is not None
+                and current_snap.cvd is not None
+                and past_snap.cvd is not None
+            ):
+                cvd_delta = current_snap.cvd - past_snap.cvd
+                price_change = bars[-1].close - bars[-1 - lookback].close
+                if winning_signal.action == "buy" and price_change > 0 and cvd_delta < 0:
+                    winning_signal = StrategySignal(
+                        action="hold", confidence=0.0, reason="cvd_divergence_blocked",
+                    )
+                elif winning_signal.action == "short" and price_change < 0 and cvd_delta > 0:
+                    winning_signal = StrategySignal(
+                        action="hold", confidence=0.0, reason="cvd_divergence_blocked",
+                    )
 
         # ADX trend strength filter
         if winning_signal.action != "hold" and self.config.adx_filter:

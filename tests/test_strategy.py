@@ -831,6 +831,67 @@ def test_rsi_filter_allows_short_when_overbought() -> None:
     assert result.signal.action == "short", "RSI filter should allow short when RSI is overbought"
 
 
+def test_rsi_relaxed_threshold_allows_long_at_25() -> None:
+    """With rsi_oversold=30, RSI=25 should ALLOW long (was blocked at threshold 20).
+
+    Relaxing from 20→30 captures more ascending channel bounces where RSI
+    is moderately oversold but not extreme.
+    """
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            rsi_filter=True,
+            rsi_period=3,
+            rsi_oversold=30.0,  # relaxed from 20
+        )
+    )
+    # RSI=25 is between 20 and 30 — should pass with new threshold
+    with patch("strategies.trend_breakout._compute_rsi", return_value=25.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+        )
+    assert result.signal.action == "buy", (
+        "RSI=25 should allow long with rsi_oversold=30 (relaxed threshold)"
+    )
+
+
+def test_rsi_relaxed_threshold_still_blocks_at_35() -> None:
+    """With rsi_oversold=30, RSI=35 should still BLOCK long (not oversold enough)."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            rsi_filter=True,
+            rsi_period=3,
+            rsi_oversold=30.0,
+        )
+    )
+    with patch("strategies.trend_breakout._compute_rsi", return_value=35.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+        )
+    assert result.signal.action == "hold", (
+        "RSI=35 should still block long with rsi_oversold=30"
+    )
+
+
 # ── ADX Mode-Aware Tests (Inverted Logic) ────────────────────────────────
 
 
@@ -1207,8 +1268,17 @@ def test_trailing_exit_still_respects_stop() -> None:
 # ── Coinglass filter tests ────────────────────────────────────────
 
 
-def _make_provider_with_new_fields(bars, top_ls_ratio=1.0, cvd=0.0, basis=0.0):
-    """Helper: provider with top_ls_ratio, cvd, basis at each bar timestamp."""
+def _make_provider_with_new_fields(
+    bars,
+    top_ls_ratio=1.0,
+    cvd=0.0,
+    basis=0.0,
+    liq_long_usd=0.0,
+    liq_short_usd=0.0,
+    taker_buy_usd=1e8,
+    taker_sell_usd=1e8,
+):
+    """Helper: provider with all Coinglass fields at each bar timestamp."""
     data = {}
     for b in bars:
         data[b.timestamp] = FuturesSnapshot(
@@ -1220,6 +1290,10 @@ def _make_provider_with_new_fields(bars, top_ls_ratio=1.0, cvd=0.0, basis=0.0):
             top_ls_ratio=top_ls_ratio,
             cvd=cvd,
             basis=basis,
+            liq_long_usd=liq_long_usd,
+            liq_short_usd=liq_short_usd,
+            taker_buy_usd=taker_buy_usd,
+            taker_sell_usd=taker_sell_usd,
         )
     return StaticFuturesProvider(data)
 
@@ -1311,3 +1385,247 @@ def test_top_ls_contrarian_blocks_short_when_too_crowded_short() -> None:
     assert result.signal.reason == "top_ls_too_crowded"
 
 
+# ── Liquidation Cascade Filter ──────────────────────────────────────
+
+
+def test_liq_cascade_blocks_long_when_long_liquidation_spike() -> None:
+    """Block long entry when long liquidation volume spikes (cascade risk)."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            liq_cascade_filter=True,
+            liq_cascade_threshold=5e7,  # $50M threshold
+        )
+    )
+
+    # Long liquidation $200M = massive long cascade → block longs
+    provider = _make_provider_with_new_fields(
+        channel_bars, liq_long_usd=2e8, liq_short_usd=1e6,
+    )
+
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+            futures_provider=provider,
+        )
+    assert result.signal.action == "hold"
+    assert "liq_cascade" in result.signal.reason
+
+
+def test_liq_cascade_allows_long_when_liquidation_normal() -> None:
+    """Allow long entry when liquidation volume is below threshold."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            liq_cascade_filter=True,
+            liq_cascade_threshold=5e7,
+        )
+    )
+
+    # Long liquidation $1M = normal → allow
+    provider = _make_provider_with_new_fields(
+        channel_bars, liq_long_usd=1e6, liq_short_usd=1e6,
+    )
+
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+            futures_provider=provider,
+        )
+    assert result.signal.reason != "liq_cascade_blocked"
+
+
+# ── Taker Buy/Sell Imbalance Filter ─────────────────────────────────
+
+
+def test_taker_imbalance_blocks_long_when_sellers_dominate() -> None:
+    """Block long when taker sell >> taker buy (no buy pressure to push breakout)."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            taker_imbalance_filter=True,
+            taker_imbalance_threshold=1.3,
+        )
+    )
+
+    # Sell $200M vs Buy $100M = ratio 0.5 → sellers dominate → block long
+    provider = _make_provider_with_new_fields(
+        channel_bars, taker_buy_usd=1e8, taker_sell_usd=2e8,
+    )
+
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+            futures_provider=provider,
+        )
+    assert result.signal.action == "hold"
+    assert "taker_imbalance" in result.signal.reason
+
+
+def test_taker_imbalance_allows_long_when_buyers_dominate() -> None:
+    """Allow long when taker buy > sell (healthy buy pressure)."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            taker_imbalance_filter=True,
+            taker_imbalance_threshold=1.3,
+        )
+    )
+
+    # Buy $200M vs Sell $100M = ratio 2.0 > 1.3 → allow
+    provider = _make_provider_with_new_fields(
+        channel_bars, taker_buy_usd=2e8, taker_sell_usd=1e8,
+    )
+
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+            futures_provider=provider,
+        )
+    assert result.signal.reason != "taker_imbalance_blocked"
+
+
+# ── CVD Divergence Filter ───────────────────────────────────────────
+
+
+def _make_provider_with_cvd_history(bars, cvd_current: float, cvd_past: float, lookback: int = 6):
+    """Build provider with CVD at current and N-lookback bars for divergence check."""
+    data = {}
+    if len(bars) > lookback:
+        past_ts = bars[-1 - lookback].timestamp
+        data[past_ts] = FuturesSnapshot(
+            timestamp=past_ts,
+            open_interest=1e9,
+            long_short_ratio=1.0,
+            taker_buy_sell_ratio=1.0,
+            oi_close=1e9,
+            cvd=cvd_past,
+        )
+    current_ts = bars[-1].timestamp
+    data[current_ts] = FuturesSnapshot(
+        timestamp=current_ts,
+        open_interest=1e9,
+        long_short_ratio=1.0,
+        taker_buy_sell_ratio=1.0,
+        oi_close=1e9,
+        cvd=cvd_current,
+    )
+    return StaticFuturesProvider(data)
+
+
+def test_cvd_divergence_blocks_long_when_price_up_cvd_down() -> None:
+    """Price rising but CVD declining = buyers exhausted. Block long."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            cvd_divergence_filter=True,
+            cvd_divergence_lookback=6,
+        )
+    )
+
+    # Price is rising (ascending channel), but CVD fell from 1B to 500M → divergence
+    provider = _make_provider_with_cvd_history(
+        channel_bars, cvd_current=5e8, cvd_past=1e9, lookback=6,
+    )
+
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+            futures_provider=provider,
+        )
+    assert result.signal.action == "hold"
+    assert "cvd_divergence" in result.signal.reason
+
+
+def test_cvd_divergence_allows_long_when_cvd_confirms() -> None:
+    """Price rising and CVD also rising = healthy trend. Allow long."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            cvd_divergence_filter=True,
+            cvd_divergence_lookback=6,
+        )
+    )
+
+    # CVD rising from 500M to 1B → confirms buy pressure
+    provider = _make_provider_with_cvd_history(
+        channel_bars, cvd_current=1e9, cvd_past=5e8, lookback=6,
+    )
+
+    with patch("strategies.trend_breakout._compute_rsi", return_value=12.0):
+        result = strategy.evaluate(
+            symbol="BTCUSDT", bars=channel_bars,
+            position=Position(symbol="BTCUSDT"),
+            futures_provider=provider,
+        )
+    assert result.signal.reason != "cvd_divergence_blocked"
+
+
+# ── Consecutive loss cooldown config ──────────────────────────────
+
+
+def test_loss_cooldown_config_defaults() -> None:
+    """loss_cooldown_count and loss_cooldown_bars fields exist with sane defaults."""
+    cfg = TrendBreakoutConfig()
+    assert cfg.loss_cooldown_count == 0, "Default should be disabled (0)"
+    assert cfg.loss_cooldown_bars == 24, "Default cooldown should be 24 bars (4 days)"
+
+
+def test_loss_cooldown_config_custom_values() -> None:
+    """Custom cooldown config values should be accepted."""
+    cfg = TrendBreakoutConfig(loss_cooldown_count=3, loss_cooldown_bars=12)
+    assert cfg.loss_cooldown_count == 3
+    assert cfg.loss_cooldown_bars == 12
