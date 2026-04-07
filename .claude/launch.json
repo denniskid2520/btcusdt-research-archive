@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Paper Trading Engine",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["run_paper.py", "--btc", "1.0", "--leverage", "3"],
+      "port": 0
+    },
+    {
+      "name": "Channel Swing Backtest",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["run_swing_backtest.py", "--start", "2025-10-01", "--end", "2026-04-05", "--leverage", "3"],
+      "port": 0
+    },
+    {
+      "name": "Full Backtest (4h Strategy)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "research.backtest", "--symbol", "BTCUSDT", "--timeframe", "1h", "--limit", "180"],
+      "port": 0
+    }
+  ]
+}

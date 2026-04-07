@@ -3,3 +3,6 @@ __pycache__/
 *.pyo
 .env
 *.egg-info/
+reports/
+state/
+channel_analysis_raw.json
