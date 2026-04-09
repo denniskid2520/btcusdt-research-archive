@@ -145,11 +145,13 @@ class BBLiveEngine:
         bars_4h = self.adapter.fetch_ohlcv(self.cfg.symbol, "4h", 30)
         bars_1d = self.adapter.fetch_ohlcv(self.cfg.symbol, "1d", 220)
 
-        if not bars_4h or not bars_1d:
-            LOGGER.warning("No bars received")
+        if not bars_4h or len(bars_4h) < 2 or not bars_1d:
+            LOGGER.warning("Not enough bars received")
             return result
 
-        latest_4h = bars_4h[-1]
+        # Use second-to-last bar — bars_4h[-1] is the currently forming candle
+        # (incomplete data), bars_4h[-2] is the most recently CLOSED candle.
+        latest_4h = bars_4h[-2]
         latest_ts = latest_4h.timestamp.isoformat()
 
         # Skip if already processed
@@ -161,7 +163,8 @@ class BBLiveEngine:
         close = latest_4h.close
 
         # Calculate indicators from native 1d bars
-        daily_closes = [b.close for b in bars_1d]
+        # Exclude the last (current/incomplete) daily bar to avoid lookahead
+        daily_closes = [b.close for b in bars_1d[:-1]]
         bb = calculate_bb(daily_closes, period=self.cfg.bb_period, k=self.cfg.bb_k)
         if bb is None:
             LOGGER.warning("Not enough daily bars for BB")
@@ -170,10 +173,11 @@ class BBLiveEngine:
 
         ma200 = calculate_sma(daily_closes, 200) if self.cfg.use_ma200 else None
 
-        # ATR for trailing stop (on 4h bars)
+        # ATR for trailing stop (on closed 4h bars only)
         atr = None
         if self.cfg.use_trailing_stop:
-            atr_bars = [{"high": b.high, "low": b.low, "close": b.close} for b in bars_4h[-20:]]
+            closed_4h = bars_4h[:-1]  # exclude current forming bar
+            atr_bars = [{"high": b.high, "low": b.low, "close": b.close} for b in closed_4h[-20:]]
             atr = calculate_atr(atr_bars, period=14)
 
         # Build diagnostic info

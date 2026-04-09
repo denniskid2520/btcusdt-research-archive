@@ -602,12 +602,13 @@ def run_bb_backtest(
         # Map to daily index
         day_key = current_ts.strftime("%Y-%m-%d")
         daily_idx = daily_date_map.get(day_key)
-        if daily_idx is None or daily_idx < min_daily:
+        if daily_idx is None or daily_idx <= min_daily:
             equity_curve.append(capital)
             continue
 
-        # Daily indicators (up to current day inclusive)
-        d_closes = daily_closes[:daily_idx + 1]
+        # Daily indicators — use only CLOSED daily bars (exclude current day
+        # to avoid lookahead bias: at 4h intraday we don't know today's close)
+        d_closes = daily_closes[:daily_idx]
 
         bb = calculate_bb(d_closes, period=config.bb_period, k=config.bb_k)
         if bb is None:
@@ -625,7 +626,7 @@ def run_bb_backtest(
         # ADX on daily bars
         adx = None
         if config.use_adx_filter:
-            adx = calculate_adx(daily_bars[:daily_idx + 1], period=config.adx_period)
+            adx = calculate_adx(daily_bars[:daily_idx], period=config.adx_period)
 
         # ATR on 4h bars for trailing stop
         atr = None
