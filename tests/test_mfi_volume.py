@@ -162,6 +162,16 @@ class TestPercentBMFI:
         assert check_bb_mfi_confirmation(pct_b=0.2, mfi=20, side="long") is False
         assert check_bb_mfi_confirmation(pct_b=0.8, mfi=80, side="short") is False
 
+    def test_custom_thresholds(self):
+        """Custom MFI thresholds should be respected (P2 fix)."""
+        from research.bb_swing_backtest import check_bb_mfi_confirmation
+        # Default 20/80 would reject MFI=25 for long, but custom 30 allows it
+        assert check_bb_mfi_confirmation(pct_b=0.1, mfi=25, side="long") is False
+        assert check_bb_mfi_confirmation(pct_b=0.1, mfi=25, side="long", mfi_oversold=30) is True
+        # Default 80 would reject MFI=75 for short, but custom 70 rejects even more
+        assert check_bb_mfi_confirmation(pct_b=0.9, mfi=75, side="short") is False
+        assert check_bb_mfi_confirmation(pct_b=0.9, mfi=75, side="short", mfi_overbought=70) is True
+
 
 # ═══════════════════════════════════════════════════════════
 # Test: Volume spike detection

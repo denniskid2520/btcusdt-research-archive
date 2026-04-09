@@ -365,16 +365,22 @@ def calculate_mfi(bars: list[dict], period: int = 14) -> float | None:
     return 100.0 - 100.0 / (1.0 + ratio)
 
 
-def check_bb_mfi_confirmation(pct_b: float, mfi: float, side: str) -> bool:
+def check_bb_mfi_confirmation(
+    pct_b: float,
+    mfi: float,
+    side: str,
+    mfi_oversold: float = 20.0,
+    mfi_overbought: float = 80.0,
+) -> bool:
     """Bollinger's %B + MFI system.
 
-    Long:  %B < 0.2 AND MFI < 20  (oversold + volume confirms)
-    Short: %B > 0.8 AND MFI > 80  (overbought + volume confirms)
+    Long:  %B < 0.2 AND MFI < mfi_oversold  (oversold + volume confirms)
+    Short: %B > 0.8 AND MFI > mfi_overbought (overbought + volume confirms)
     """
     if side == "long":
-        return pct_b < 0.2 and mfi < 20
+        return pct_b < 0.2 and mfi < mfi_oversold
     elif side == "short":
-        return pct_b > 0.8 and mfi > 80
+        return pct_b > 0.8 and mfi > mfi_overbought
     return False
 
 
@@ -863,7 +869,11 @@ def run_bb_backtest(
                 if signal is not None:
                     # MFI filter: require volume confirmation
                     if config.use_mfi_filter and mfi is not None:
-                        if not check_bb_mfi_confirmation(pct_b, mfi, signal):
+                        if not check_bb_mfi_confirmation(
+                            pct_b, mfi, signal,
+                            mfi_oversold=config.mfi_oversold,
+                            mfi_overbought=config.mfi_overbought,
+                        ):
                             signal = None  # volume not confirming
 
                     # Volume spike filter

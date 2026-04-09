@@ -89,12 +89,11 @@ class BBLiveState:
     last_exit_ts: str = ""
     # 15m confirmation pending signal
     pending_signal_side: str = ""      # "long" or "short" or "" (no pending)
-    pending_signal_bar: int = 0        # bar index when signal was created
+    pending_signal_ts: str = ""        # ISO timestamp when signal was created
     pending_signal_bb_upper: float = 0.0
     pending_signal_bb_middle: float = 0.0
     pending_signal_bb_lower: float = 0.0
     pending_signal_bb_width: float = 0.0
-    tick_count: int = 0                # monotonic bar counter
 
     @property
     def is_position_open(self) -> bool:
@@ -213,29 +212,35 @@ class BBLiveEngine:
             "position": self.state.position_side,
         }
 
-        self.state.tick_count += 1
-
         if not self.state.is_position_open:
             # Handle pending 15m confirmation signal
             if self.state.pending_signal_side:
-                wait = self.state.tick_count - self.state.pending_signal_bar
-                if wait > self.cfg.confirm_max_wait_bars:
-                    LOGGER.info("Pending %s signal expired after %d bars",
-                               self.state.pending_signal_side, wait)
+                # P1 fix: expire using real candle timestamps, not tick counter
+                signal_ts = datetime.fromisoformat(self.state.pending_signal_ts)
+                current_ts = datetime.fromisoformat(latest_ts)
+                hours_elapsed = (current_ts - signal_ts).total_seconds() / 3600
+                max_wait_hours = self.cfg.confirm_max_wait_bars * 4  # bars × 4h
+
+                if hours_elapsed > max_wait_hours:
+                    LOGGER.info("Pending %s signal expired after %.1f hours",
+                               self.state.pending_signal_side, hours_elapsed)
                     self._clear_pending_signal()
                 else:
-                    # Check confirmation: current 4h bar breaks prev bar's high/low
-                    prev_4h = bars_4h[-3] if len(bars_4h) >= 3 else bars_4h[-2]
+                    # P1 fix: use real 15m bars for confirmation instead of 4h proxy
+                    bars_15m = self.adapter.fetch_ohlcv(self.cfg.symbol, "15m", 8)
                     confirmed = False
-                    if self.state.pending_signal_side == "long":
-                        confirmed = close > prev_4h.high
-                    elif self.state.pending_signal_side == "short":
-                        confirmed = close < prev_4h.low
+                    if bars_15m and len(bars_15m) >= 2:
+                        prev_15m = bars_15m[-2]
+                        last_15m = bars_15m[-1]
+                        if self.state.pending_signal_side == "long":
+                            confirmed = last_15m.close > prev_15m.high
+                        elif self.state.pending_signal_side == "short":
+                            confirmed = last_15m.close < prev_15m.low
 
                     if confirmed:
                         signal_side = self.state.pending_signal_side
-                        LOGGER.info("15m confirmation triggered for %s after %d bars",
-                                   signal_side, wait)
+                        LOGGER.info("15m confirmation triggered for %s after %.1fh",
+                                   signal_side, hours_elapsed)
                         # Restore BB state from when signal was created
                         from research.bb_swing_backtest import BBState
                         saved_bb = BBState(
@@ -249,7 +254,7 @@ class BBLiveEngine:
                     else:
                         result["action"] = "pending_confirmation"
                         result["pending_side"] = self.state.pending_signal_side
-                        result["bars_waiting"] = wait
+                        result["hours_waiting"] = round(hours_elapsed, 1)
 
             # Check for new signal (only if no pending and no position)
             if not self.state.is_position_open and not self.state.pending_signal_side:
@@ -300,7 +305,7 @@ class BBLiveEngine:
         # 15m confirmation mode: defer entry, save as pending signal
         if self.cfg.use_15m_confirmation:
             self.state.pending_signal_side = signal
-            self.state.pending_signal_bar = self.state.tick_count
+            self.state.pending_signal_ts = self.state.last_candle_ts
             self.state.pending_signal_bb_upper = bb.upper
             self.state.pending_signal_bb_middle = bb.middle
             self.state.pending_signal_bb_lower = bb.lower
@@ -389,7 +394,7 @@ class BBLiveEngine:
     def _clear_pending_signal(self) -> None:
         """Clear the pending 15m confirmation signal."""
         self.state.pending_signal_side = ""
-        self.state.pending_signal_bar = 0
+        self.state.pending_signal_ts = ""
         self.state.pending_signal_bb_upper = 0.0
         self.state.pending_signal_bb_middle = 0.0
         self.state.pending_signal_bb_lower = 0.0
