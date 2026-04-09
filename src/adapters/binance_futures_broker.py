@@ -92,7 +92,29 @@ class BinanceFuturesBroker:
             resp.raise_for_status()
         return resp.json()
 
-    # ── Account ──
+    # ── Account setup ──
+
+    def ensure_leverage(self, symbol: str, leverage: int) -> None:
+        """Verify and set leverage + isolated margin on the exchange."""
+        # Set margin type to ISOLATED (ignore error if already set)
+        try:
+            self._request("POST", "/fapi/v1/marginType", {
+                "symbol": symbol, "marginType": "ISOLATED",
+            })
+            LOGGER.info("Set %s margin to ISOLATED", symbol)
+        except Exception:
+            pass  # Already ISOLATED
+
+        # Set leverage
+        result = self._request("POST", "/fapi/v1/leverage", {
+            "symbol": symbol, "leverage": leverage,
+        })
+        actual = result.get("leverage", leverage)
+        LOGGER.info("Set %s leverage to %sx (confirmed: %s)", symbol, leverage, actual)
+        if int(actual) != leverage:
+            raise ValueError(
+                f"Leverage mismatch: requested {leverage}x but got {actual}x"
+            )
 
     def get_balance(self) -> dict:
         """Get USDT balance info."""

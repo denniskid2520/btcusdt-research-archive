@@ -127,6 +127,8 @@ class BBLiveEngine:
         if self.cfg.live_mode:
             from adapters.binance_futures_broker import BinanceFuturesBroker
             self.broker = BinanceFuturesBroker()
+            # Verify exchange leverage matches config before trading
+            self.broker.ensure_leverage(self.cfg.symbol, self.cfg.leverage)
             LOGGER.info("LIVE MODE — orders will be sent to Binance")
 
     def tick(self) -> dict[str, Any]:
