@@ -37,19 +37,25 @@ def main() -> None:
 
     state_path = Path(args.state_dir) / "live_d_state.json"
 
+    # Config [E]: optimized via 1080-config sweep (2026-04-10)
+    # BB(20,2.5) SMA, mid target, 3.5% stop, 10% risk, trail+15m
+    # Backtest: +552%, DD 41.2%, R/DD 13.40, WR 70.7%, PF 2.60
     config = BBLiveConfig(
         symbol="BTCUSDT",
         leverage=5,
         initial_usdt=10000.0,
         bb_period=20,
         bb_k=2.5,
-        stop_loss_pct=0.03,
-        risk_per_trade=0.065,
+        bb_type="sma",
+        stop_loss_pct=0.035,          # widened from 3% to 3.5%
+        risk_per_trade=0.10,           # raised from 6.5% to 10%
         use_ma200=True,
         use_trailing_stop=True,
         trailing_activation_pct=0.03,
-        trailing_atr_multiplier=1.5,
+        trailing_atr_multiplier=2.0,   # raised from 1.5 to 2.0
         max_hold_bars=180,
+        use_15m_confirmation=True,     # NEW: wait for micro-breakout
+        confirm_max_wait_bars=6,
         live_mode=True,  # <-- REAL ORDERS
     )
 

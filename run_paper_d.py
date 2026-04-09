@@ -33,19 +33,23 @@ def main() -> None:
 
     state_path = Path(args.state_dir) / "paper_d_state.json"
 
+    # Config [E]: optimized via 1080-config sweep (2026-04-10)
     config = BBLiveConfig(
         symbol="BTCUSDT",
         leverage=5,
         initial_usdt=10000.0,
         bb_period=20,
         bb_k=2.5,
-        stop_loss_pct=0.03,
-        risk_per_trade=0.065,
+        bb_type="sma",
+        stop_loss_pct=0.035,
+        risk_per_trade=0.10,
         use_ma200=True,
         use_trailing_stop=True,
         trailing_activation_pct=0.03,
-        trailing_atr_multiplier=1.5,
+        trailing_atr_multiplier=2.0,
         max_hold_bars=180,
+        use_15m_confirmation=True,
+        confirm_max_wait_bars=6,
     )
 
     engine = BBLiveEngine(state_path=state_path, config=config)
