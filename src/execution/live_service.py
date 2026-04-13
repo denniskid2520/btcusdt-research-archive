@@ -87,14 +87,18 @@ class LiveService:
         self.runner = self._load_runner()
         self.last_bar_ts: datetime | None = self._load_last_bar_ts()
 
-        # FIX 2: restore persisted live-position fields from state.json
-        # so a restart during an open trade doesn't lose position tracking.
+        # Restore persisted live-position fields from state.json
         self.has_live_position = False
         self.live_entry_price: float = 0.0
         self.live_quantity: float = 0.0
         self.live_alpha_level: float = 0.0
         self.live_catastrophe_level: float = 0.0
         self.open_catastrophe_order_id: str | None = None
+        # HALT state: position_unknown means we can't confirm whether
+        # a position exists. No new entries allowed until reconciliation
+        # confirms zero position on the exchange.
+        self.halted: bool = False
+        self.halt_reason: str = ""
         self._restore_live_position_state()
 
     def _restore_live_position_state(self) -> None:
@@ -116,9 +120,15 @@ class LiveService:
             self.live_alpha_level = saved.get("live_alpha_level", 0.0)
             self.live_catastrophe_level = saved.get("live_catastrophe_level", 0.0)
             self.open_catastrophe_order_id = saved.get("open_catastrophe_order_id")
+            self.halted = saved.get("halted", False)
+            self.halt_reason = saved.get("halt_reason", "")
         except Exception as e:
             emit_alert(CANDIDATE_ID, "WARN", f"Failed to restore live position: {e}")
             return
+
+        if self.halted:
+            self._log_tick(
+                f"HALTED state restored: {self.halt_reason}")
 
         if not self.has_live_position:
             return
@@ -191,13 +201,15 @@ class LiveService:
                 "next_zone_id": self.runner.state.next_zone_id,
                 "bars_since_last_exit": self.runner.state.bars_since_last_exit,
                 "trade_count": len(self.runner.trades),
-                # FIX 2: persist ALL live-position fields for restart recovery
+                # Persist ALL live-position fields for restart recovery
                 "has_live_position": self.has_live_position,
                 "live_entry_price": self.live_entry_price,
                 "live_quantity": self.live_quantity,
                 "live_alpha_level": self.live_alpha_level,
                 "live_catastrophe_level": self.live_catastrophe_level,
                 "open_catastrophe_order_id": self.open_catastrophe_order_id,
+                "halted": self.halted,
+                "halt_reason": self.halt_reason,
             }, indent=2, default=str),
         )
 
@@ -285,12 +297,29 @@ class LiveService:
             self._log_tick("Orphaned stop orders found, cancelling")
             cancel_all_orders(self.api_key, self.api_secret)
 
+        # If halted due to position_unknown, check if exchange now
+        # confirms zero → clear halt and allow new entries.
+        if self.halted and not has_exchange_pos:
+            self._log_tick(
+                "HALT cleared: exchange confirms zero position. "
+                f"Previous halt reason: {self.halt_reason}")
+            emit_alert(CANDIDATE_ID, "WARN",
+                       "HALT cleared by reconciliation — "
+                       "exchange confirmed zero position")
+            self.halted = False
+            self.halt_reason = ""
+            self.has_live_position = False
+            self.live_entry_price = 0.0
+            self.live_quantity = 0.0
+            self._save_runner()
+
         self._log_event({
             "type": "reconciliation",
             "ts": datetime.utcnow().isoformat(),
             "has_exchange_pos": has_exchange_pos,
             "has_cat_stop": has_cat_stop,
             "internal_has_pos": self.has_live_position,
+            "halted": self.halted,
         })
 
     # ── bar processing ──────────────────────────────────────────
@@ -320,7 +349,11 @@ class LiveService:
 
         # ENTRY: runner queued an entry (position_state went to "open")
         if "ENTRY_FILL" in " ".join(events) and not self.has_live_position:
-            self._handle_entry(bar)
+            if self.halted:
+                self._log_tick(
+                    f"ENTRY BLOCKED — system halted: {self.halt_reason}")
+            else:
+                self._handle_entry(bar)
 
         # EXIT: runner closed a trade
         if "TRADE_CLOSE" in " ".join(events) and self.has_live_position:
@@ -416,7 +449,9 @@ class LiveService:
                     and flatten_evt.get("status") == "FILLED"
                 )
                 if flatten_ok:
-                    # Verify exchange position is actually zero
+                    # Verify exchange position is actually zero.
+                    # If verification FAILS (API error), we CANNOT assume
+                    # flat — position state is UNKNOWN → HALT.
                     try:
                         pos = fetch_position(self.api_key, self.api_secret)
                         pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
@@ -430,10 +465,25 @@ class LiveService:
                             self.live_quantity = abs(pos_amt)
                             self._save_runner()
                             return
+                        self._log_tick(
+                            "Partial fill flattened and confirmed zero")
                     except Exception as e:
-                        emit_alert(CANDIDATE_ID, "WARN",
-                                   f"Could not verify zero position: {e}")
-                    self._log_tick("Partial fill flattened and confirmed zero")
+                        # CODEX FIX: verification failure = position_unknown.
+                        # Must HALT — do NOT assume flat.
+                        emit_alert(CANDIDATE_ID, "CRITICAL",
+                                   f"Post-flatten position verification FAILED: "
+                                   f"{e} — HALTING, position state unknown")
+                        self.halted = True
+                        self.halt_reason = (
+                            f"position_unknown: flatten reported FILLED but "
+                            f"fetch_position failed: {e}"
+                        )
+                        self.has_live_position = True
+                        self.live_entry_price = float(
+                            entry_evt.get("avgPrice", price))
+                        self.live_quantity = partial_qty
+                        self._save_runner()
+                        return
                 else:
                     # Flatten failed — naked partial position
                     emit_alert(CANDIDATE_ID, "CRITICAL",

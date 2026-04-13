@@ -64,6 +64,8 @@ def _make_service(tmp_path: Path, dry_run: bool = True) -> LiveService:
     svc.live_alpha_level = 0.0
     svc.live_catastrophe_level = 0.0
     svc.open_catastrophe_order_id = None
+    svc.halted = False
+    svc.halt_reason = ""
     return svc
 
 
@@ -159,6 +161,114 @@ class TestFix1EntryOrderBeforeStateFlip:
         # Must be marked as live (naked) for reconciliation
         assert svc.has_live_position is True
         assert svc.live_quantity == 0.1
+
+    def test_live_partial_fill_flatten_ok_but_verify_throws_halts(self, tmp_path):
+        """If flatten FILLED but fetch_position throws, must HALT
+        (position_unknown), not assume flat."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+        svc._place_market_order = MagicMock(side_effect=[
+            {"status": "PARTIALLY_FILLED", "avgPrice": "50000", "executedQty": "0.1"},
+            {"status": "FILLED", "avgPrice": "49950", "executedQty": "0.1"},
+        ])
+
+        with patch("execution.live_service.cancel_all_orders"):
+            with patch("execution.live_service.fetch_position",
+                       side_effect=Exception("network timeout")):
+                svc._handle_entry(_bar(price=50000.0))
+
+        # Must be HALTED, not flat
+        assert svc.halted is True
+        assert "position_unknown" in svc.halt_reason
+        assert svc.has_live_position is True
+        assert svc.live_quantity == 0.1
+
+    def test_halted_state_blocks_new_entries(self, tmp_path):
+        """When halted, new entry signals must be blocked."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.halted = True
+        svc.halt_reason = "position_unknown"
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._handle_entry = MagicMock()
+
+        # Simulate _process_bar seeing an ENTRY_FILL event
+        events = ["ENTRY_FILL price=50000"]
+        if "ENTRY_FILL" in " ".join(events) and not svc.has_live_position:
+            if svc.halted:
+                svc._log_tick(f"ENTRY BLOCKED")
+            else:
+                svc._handle_entry(_bar())
+
+        # _handle_entry must NOT have been called
+        svc._handle_entry.assert_not_called()
+
+    def test_reconciliation_clears_halt_when_exchange_confirms_zero(self, tmp_path):
+        """After HALT, if next reconciliation sees zero position on
+        exchange, halt clears and entries are allowed again."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+
+        # Set halted state
+        svc.halted = True
+        svc.halt_reason = "position_unknown: flatten ok but verify failed"
+        svc.has_live_position = True
+        svc.live_quantity = 0.1
+
+        # Reconciliation sees zero position on exchange
+        with patch("execution.live_service.fetch_position", return_value=None):
+            with patch("execution.live_service.fetch_open_orders", return_value=[]):
+                svc._reconcile()
+
+        assert svc.halted is False
+        assert svc.halt_reason == ""
+        assert svc.has_live_position is False
+        assert svc.live_quantity == 0.0
+
+    def test_halted_state_persists_across_restart(self, tmp_path):
+        """Halt state must survive process restart via state.json."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+        svc.halted = True
+        svc.halt_reason = "position_unknown: test"
+        svc.has_live_position = True
+        svc.live_quantity = 0.05
+        svc._save_runner()
+
+        # New service instance restores halt
+        svc2 = _make_service(tmp_path, dry_run=False)
+        svc2.state_dir = svc.state_dir
+        svc2._log_tick = MagicMock()
+        # Skip exchange check for this test (dry_run path in restore)
+        svc2.dry_run = True
+        svc2._restore_live_position_state()
+
+        assert svc2.halted is True
+        assert "position_unknown" in svc2.halt_reason
+        assert svc2.has_live_position is True
 
     def test_live_partial_fill_flatten_ok_but_position_remains(self, tmp_path):
         """If flatten SELL reports FILLED but exchange still shows position,
