@@ -335,9 +335,22 @@ class LiveService:
 
     # ── bar processing ──────────────────────────────────────────
 
-    def _process_bar(self, bar: MarketBar) -> None:
+    def _process_bar(
+        self, bar: MarketBar, *, replay_only: bool = False,
+    ) -> None:
+        """Process one completed 1h bar.
+
+        Args:
+            bar: the completed bar to process.
+            replay_only: if True, update internal strategy state but
+                do NOT place live orders. Used during missed-bar
+                catch-up to avoid executing stale signals on the
+                exchange. The paper runner still ticks normally so
+                regime/RSI/position state stays consistent.
+        """
+        label = "[REPLAY] " if replay_only else ""
         self._log_tick(
-            f"bar {bar.timestamp} O={bar.open:.2f} H={bar.high:.2f} "
+            f"{label}bar {bar.timestamp} O={bar.open:.2f} H={bar.high:.2f} "
             f"L={bar.low:.2f} C={bar.close:.2f}"
         )
 
@@ -345,34 +358,40 @@ class LiveService:
         if bar.timestamp.hour in (0, 8, 16):
             funding = fetch_funding_rate()
 
-        # Feed to paper runner (strategy logic)
+        # Feed to paper runner (strategy logic — always runs)
         prev_count = len(self.runner.trades)
         events = self.runner.tick(bar, funding)
 
         for e in events:
-            self._log_tick(f"  event: {e}")
+            self._log_tick(f"  {label}event: {e}")
 
-        # Check for new trade signals from the runner
         new_trades = self.runner.trades[prev_count:]
-
-        # Check runner state for entry/exit decisions
         state = self.runner.state
 
-        # ENTRY: runner queued an entry (position_state went to "open")
-        if "ENTRY_FILL" in " ".join(events) and not self.has_live_position:
-            if self.halted:
+        if replay_only:
+            # During catch-up replay: update state, log events, but
+            # do NOT place live orders. Stale signals must not execute.
+            if "ENTRY_FILL" in " ".join(events):
                 self._log_tick(
-                    f"ENTRY BLOCKED — system halted: {self.halt_reason}")
-            else:
-                self._handle_entry(bar)
+                    f"  [REPLAY] entry signal SKIPPED (stale bar)")
+            if "TRADE_CLOSE" in " ".join(events):
+                self._log_tick(
+                    f"  [REPLAY] exit signal SKIPPED (stale bar)")
+        else:
+            # Live bar: execute signals normally
+            if "ENTRY_FILL" in " ".join(events) and not self.has_live_position:
+                if self.halted:
+                    self._log_tick(
+                        f"ENTRY BLOCKED — system halted: {self.halt_reason}")
+                else:
+                    self._handle_entry(bar)
 
-        # EXIT: runner closed a trade
-        if "TRADE_CLOSE" in " ".join(events) and self.has_live_position:
-            exit_reason = ""
-            for e in events:
-                if "TRADE_CLOSE" in e:
-                    exit_reason = e
-            self._handle_exit(bar, exit_reason)
+            if "TRADE_CLOSE" in " ".join(events) and self.has_live_position:
+                exit_reason = ""
+                for e in events:
+                    if "TRADE_CLOSE" in e:
+                        exit_reason = e
+                self._handle_exit(bar, exit_reason)
 
         # Log telemetry for new trades
         if new_trades:
@@ -643,10 +662,9 @@ class LiveService:
             self._log_tick("RSI buffer short, fetching warmup bars...")
             self._warmup()
 
-        # P1 FIX: missed-bar catch-up on startup.
-        # If service was down, fetch all bars between last_processed
-        # and the current completed bar and replay them sequentially.
-        self._catch_up_missed_bars()
+        # Missed-bar catch-up on startup (replay_only — no live orders).
+        if not self._catch_up_missed_bars():
+            self._log_tick("WARN: startup catch-up failed, will retry in loop")
 
         self._log_tick("Entering polling loop...")
 
@@ -661,19 +679,26 @@ class LiveService:
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                # New bar detected — check for gaps first
+                # CODEX FIX: if there's a gap, catch up first.
+                # Only process the newest bar if catch-up succeeds.
+                # If catch-up fails, skip this tick entirely — do NOT
+                # process the latest bar with intermediate bars missing.
                 if self.last_bar_ts is not None:
                     expected_next = self.last_bar_ts + timedelta(hours=1)
                     if bar.timestamp > expected_next:
-                        # Gap detected — catch up missed bars
                         self._log_tick(
                             f"Gap detected: last={self.last_bar_ts} "
                             f"current={bar.timestamp} — catching up")
-                        self._catch_up_missed_bars()
+                        if not self._catch_up_missed_bars():
+                            self._log_tick(
+                                "Catch-up FAILED — skipping this tick, "
+                                "will retry next poll")
+                            time.sleep(POLL_INTERVAL)
+                            continue
 
-                # Process the current bar (catch-up may have already done it)
+                # Process the current bar (live — may place orders)
                 if self.last_bar_ts is None or bar.timestamp > self.last_bar_ts:
-                    self._process_bar(bar)
+                    self._process_bar(bar)  # replay_only=False (default)
 
             except KeyboardInterrupt:
                 self._log_tick("Shutting down (KeyboardInterrupt)")
@@ -686,27 +711,32 @@ class LiveService:
 
             time.sleep(POLL_INTERVAL)
 
-    def _catch_up_missed_bars(self) -> None:
-        """Fetch and replay all completed bars since last_processed_ts."""
+    def _catch_up_missed_bars(self) -> bool:
+        """Fetch and replay all completed bars since last_processed_ts.
+
+        Returns True if catch-up succeeded (or no catch-up needed).
+        Returns False if catch-up failed (fetch error, etc.).
+        Caller must NOT process the latest bar if this returns False.
+        """
         if self.last_bar_ts is None:
-            return
+            return True
         try:
             server_time = fetch_server_time()
         except Exception:
-            return
+            return False
         last_completed = server_time.replace(
             minute=0, second=0, microsecond=0
         ) - timedelta(hours=1)
 
         if last_completed <= self.last_bar_ts:
-            return
+            return True  # already up to date
 
         fetch_start = self.last_bar_ts + timedelta(hours=1)
         missed_count = int(
             (last_completed - self.last_bar_ts).total_seconds() / 3600
         )
         if missed_count <= 0:
-            return
+            return True
 
         self._log_tick(
             f"Catching up {missed_count} missed bars: "
@@ -731,7 +761,7 @@ class LiveService:
                 data = json.loads(resp.read())
         except Exception as e:
             emit_alert(CANDIDATE_ID, "WARN", f"Catch-up fetch failed: {e}")
-            return
+            return False
 
         for k in data:
             ts = datetime.fromtimestamp(
@@ -743,9 +773,12 @@ class LiveService:
                 timestamp=ts, open=float(k[1]), high=float(k[2]),
                 low=float(k[3]), close=float(k[4]), volume=float(k[5]),
             )
-            self._process_bar(bar)
+            # CODEX FIX: replay_only=True — do NOT place live orders
+            # for stale bars. Only update internal strategy state.
+            self._process_bar(bar, replay_only=True)
 
         self._log_tick(f"Catch-up complete, now at {self.last_bar_ts}")
+        return True
 
     def _warmup(self) -> None:
         """Fetch last 200 1h bars for RSI buffer initialization."""
