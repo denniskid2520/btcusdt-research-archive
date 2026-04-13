@@ -169,9 +169,40 @@ DEPLOYMENT_CONFIGS = {
 
 # ── Binance API helpers ─────────────────────────────────────────────
 
+# Server-time offset (ms): server_time - local_time.
+# Updated by sync_server_time_offset() on startup.
+_server_time_offset_ms: int = 0
+
+RECV_WINDOW_MS = 5000  # Binance default max is 60000; 5s is safe
+
+
+def sync_server_time_offset() -> int:
+    """Fetch Binance server time and compute offset from local clock.
+
+    Returns offset in ms (positive = server ahead of local).
+    Updates module-level _server_time_offset_ms for use in _signed_request.
+    """
+    global _server_time_offset_ms
+    try:
+        url = "https://fapi.binance.com/fapi/v1/time"
+        local_before = int(time.time() * 1000)
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        local_after = int(time.time() * 1000)
+        server_time = data["serverTime"]
+        # Estimate: server_time ≈ midpoint of local_before..local_after
+        local_mid = (local_before + local_after) // 2
+        _server_time_offset_ms = server_time - local_mid
+        return _server_time_offset_ms
+    except Exception:
+        return _server_time_offset_ms  # keep previous offset
+
+
 def _signed_request(method: str, endpoint: str, params: dict,
                     api_key: str, api_secret: str) -> dict:
-    params["timestamp"] = str(int(time.time() * 1000))
+    # Use server-time-offset-adjusted timestamp to prevent rejects
+    params["timestamp"] = str(int(time.time() * 1000) + _server_time_offset_ms)
+    params["recvWindow"] = str(RECV_WINDOW_MS)
     query = urllib.parse.urlencode(params)
     sig = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
     url = f"https://fapi.binance.com{endpoint}?{query}&signature={sig}"
