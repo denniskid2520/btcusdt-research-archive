@@ -56,6 +56,7 @@ from execution.live_executor import (
     load_env,
     log_stop_event,
     place_catastrophe_stop,
+    sync_server_time_offset,
 )
 from execution.paper_runner_v2 import PaperRunnerV2
 
@@ -511,15 +512,26 @@ class LiveService:
                     pos = fetch_position(self.api_key, self.api_secret)
                     pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
                     if abs(pos_amt) > 0.0001:
+                        # Prefer exchange entryPrice over bar.open
+                        # for more accurate stop level derivation.
+                        entry_px = float(pos.get("entryPrice", 0))
+                        if entry_px <= 0:
+                            entry_px = price  # fallback to bar.open
                         emit_alert(CANDIDATE_ID, "CRITICAL",
                                    f"Entry order unknown but exchange has "
-                                   f"position {pos_amt} — HALTING")
+                                   f"position {pos_amt} @ {entry_px:.2f} — HALTING")
                         self.halted = True
                         self.halt_reason = (
                             f"entry_unknown_but_position_exists: {pos_amt}")
                         self.has_live_position = True
                         self.live_quantity = abs(pos_amt)
-                        self.live_entry_price = price
+                        self.live_entry_price = entry_px
+                        # CODEX P1: persist stop levels so _reconcile()
+                        # can re-place catastrophe stop automatically.
+                        self.live_alpha_level = entry_px * (
+                            1 - self.candidate_cfg.alpha_stop_pct)
+                        self.live_catastrophe_level = entry_px * (
+                            1 - self.candidate_cfg.catastrophe_stop_pct)
                         self._save_runner()
                         return
                 except Exception:
@@ -878,6 +890,10 @@ class LiveService:
         cap_label = f" max_cap=${self.max_cap_usd}" if self.max_cap_usd else ""
         self._log_tick(f"=== Phase 14 {mode_label}{cap_label} service starting ===")
         self._log_tick(f"candidate={CANDIDATE_ID} lev={self.candidate_cfg.exchange_leverage}x")
+
+        # Sync server-time offset for accurate timestamps
+        offset = sync_server_time_offset()
+        self._log_tick(f"Server-time offset: {offset}ms")
 
         # Initial balance check
         equity = self._get_strategy_equity()
