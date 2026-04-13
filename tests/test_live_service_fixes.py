@@ -679,6 +679,66 @@ class TestP2HaltClearingOnStartup:
 class TestP1MissedBarCatchUp:
     """P1: live_service must catch up missed bars after downtime."""
 
+    def test_catch_up_uses_replay_only_no_live_orders(self, tmp_path):
+        """Catch-up must pass replay_only=True so no live orders fire."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._handle_entry = MagicMock()
+        svc._handle_exit = MagicMock()
+        from execution.paper_runner_v2 import PaperRunnerV2, CandidateConfig
+        real_runner = PaperRunnerV2(CandidateConfig(
+            candidate_id="test", regime_rsi_period=3, regime_threshold=70.0,
+            entry_mode="hybrid", pullback_pct=0.0075, breakout_pct=0.0025,
+            max_entries_per_zone=6, cooldown_bars=2, hold_bars=24,
+            exchange_leverage=3.0, base_frac=2.0, max_frac=3.0,
+            alpha_stop_pct=0.0125, catastrophe_stop_pct=0.025,
+        ))
+        real_runner._rsi_buffer = [50000.0] * 200
+        svc.runner = real_runner
+        svc.last_bar_ts = datetime(2024, 1, 1, 10, 0)
+
+        mock_server = datetime(2024, 1, 1, 13, 30)
+        mock_bars = [
+            [int((datetime(2024, 1, 1, h, 0).replace(
+                tzinfo=timezone.utc).timestamp()) * 1000),
+             "50000", "50100", "49900", "50050", "100"]
+            for h in [11, 12]
+        ]
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_bars).encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("execution.live_service.fetch_server_time", return_value=mock_server):
+            with patch("urllib.request.urlopen", return_value=mock_resp):
+                with patch("execution.live_service.fetch_funding_rate", return_value=0.0):
+                    with patch("execution.live_service.fetch_account_balance") as mb:
+                        mb.return_value = MagicMock(available_balance=10000.0)
+                        result = svc._catch_up_missed_bars()
+
+        assert result is True
+        # _handle_entry and _handle_exit must NOT be called during replay
+        svc._handle_entry.assert_not_called()
+        svc._handle_exit.assert_not_called()
+        # But bars were processed (last_bar_ts advanced)
+        assert svc.last_bar_ts == datetime(2024, 1, 1, 12, 0)
+
+    def test_catch_up_failure_returns_false(self, tmp_path):
+        """If fetch fails, catch-up returns False."""
+        svc = _make_service(tmp_path, dry_run=True)
+        svc._log_tick = MagicMock()
+        svc.last_bar_ts = datetime(2024, 1, 1, 10, 0)
+        mock_server = datetime(2024, 1, 1, 14, 30)
+
+        with patch("execution.live_service.fetch_server_time", return_value=mock_server):
+            with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
+                result = svc._catch_up_missed_bars()
+
+        assert result is False
+        # last_bar_ts should NOT have advanced
+        assert svc.last_bar_ts == datetime(2024, 1, 1, 10, 0)
+
     def test_catch_up_detects_and_replays_gap(self, tmp_path):
         svc = _make_service(tmp_path, dry_run=True)
         svc._log_tick = MagicMock()
