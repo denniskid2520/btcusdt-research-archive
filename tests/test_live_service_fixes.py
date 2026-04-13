@@ -66,6 +66,7 @@ def _make_service(tmp_path: Path, dry_run: bool = True) -> LiveService:
     svc.open_catastrophe_order_id = None
     svc.halted = False
     svc.halt_reason = ""
+    svc._order_in_progress = False
     return svc
 
 
@@ -575,19 +576,20 @@ class TestP0ExitOrder:
         assert svc.has_live_position is False
 
     def test_live_exit_submits_sell_before_clearing(self, tmp_path):
-        """Live mode must submit MARKET SELL and get FILLED before flat."""
+        """Live mode must submit reduceOnly SELL and get FILLED before flat."""
         svc = _make_service(tmp_path, dry_run=False)
         svc.has_live_position = True
         svc.live_quantity = 0.3
         svc._log_tick = MagicMock()
         svc._log_event = MagicMock()
-        svc._place_market_order = MagicMock(return_value={
+        svc._place_reduce_only_order = MagicMock(return_value={
             "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
         })
         with patch("execution.live_service.cancel_all_orders"):
-            svc._handle_exit(_bar(), "time_stop")
+            with patch("execution.live_service.fetch_position", return_value=None):
+                svc._handle_exit(_bar(), "time_stop")
         assert svc.has_live_position is False
-        svc._place_market_order.assert_called_once_with("SELL", 0.3)
+        svc._place_reduce_only_order.assert_called_once_with("SELL", 0.3)
 
     def test_live_exit_sell_fails_halts(self, tmp_path):
         """If SELL fails, do NOT clear position — halt instead."""
@@ -604,7 +606,7 @@ class TestP0ExitOrder:
         svc.runner.state.next_zone_id = 2
         svc.runner.state.bars_since_last_exit = 5
         svc.runner.trades = []
-        svc._place_market_order = MagicMock(return_value=None)
+        svc._place_reduce_only_order = MagicMock(return_value=None)
         with patch("execution.live_service.cancel_all_orders"):
             svc._handle_exit(_bar(), "time_stop")
         assert svc.has_live_position is True
@@ -625,7 +627,7 @@ class TestP0ExitOrder:
         svc.runner.state.next_zone_id = 2
         svc.runner.state.bars_since_last_exit = 5
         svc.runner.trades = []
-        svc._place_market_order = MagicMock(return_value={
+        svc._place_reduce_only_order = MagicMock(return_value={
             "status": "NEW", "avgPrice": "0", "executedQty": "0",
         })
         with patch("execution.live_service.cancel_all_orders"):
@@ -732,32 +734,18 @@ class TestP1MissedBarCatchUp:
         svc.has_live_position = True
         svc.live_quantity = 0.3
         svc.live_entry_price = 50000.0
-        svc._place_market_order = MagicMock(return_value={
+        svc._place_reduce_only_order = MagicMock(return_value={
             "status": "FILLED", "avgPrice": "50100", "executedQty": "0.3",
         })
 
         bar = _bar(price=50100.0)
-        # Simulate runner emitting TRADE_CLOSE during replay
-        svc.runner.tick = MagicMock(return_value=None)
-        svc.runner.trades = []
-        svc.runner.state.position_state = "flat"
 
-        # Manually call _process_bar in replay mode with a TRADE_CLOSE event
-        # We need the runner to emit the event, so mock it
-        with patch.object(svc.runner, 'tick', return_value=["TRADE_CLOSE #1 reason=time_stop"]):
-            with patch.object(svc.runner, 'trades', new_callable=lambda: property(lambda s: [])):
-                pass
-        # Simpler: call _process_bar and inject events
-        original_tick = svc.runner.tick
-        svc.runner.tick = lambda b, f: None
-        svc.runner.trades = []
-
-        # Direct test: call _handle_exit during replay
         with patch("execution.live_service.cancel_all_orders"):
-            svc._handle_exit(bar, "time_stop")
+            with patch("execution.live_service.fetch_position", return_value=None):
+                svc._handle_exit(bar, "time_stop")
 
         assert svc.has_live_position is False
-        svc._place_market_order.assert_called_once_with("SELL", 0.3)
+        svc._place_reduce_only_order.assert_called_once_with("SELL", 0.3)
 
     def test_replay_exit_skipped_when_no_live_position(self, tmp_path):
         """Replay TRADE_CLOSE with no live position → skip."""
@@ -816,7 +804,7 @@ class TestP1MissedBarCatchUp:
         svc.runner.state.next_zone_id = 2
         svc.runner.state.bars_since_last_exit = 5
         svc.runner.trades = []
-        svc._place_market_order = MagicMock(return_value=None)  # SELL fails
+        svc._place_reduce_only_order = MagicMock(return_value=None)
 
         with patch("execution.live_service.cancel_all_orders"):
             svc._handle_exit(_bar(), "time_stop")
@@ -927,8 +915,124 @@ class TestP1MissedBarCatchUp:
         assert svc.last_bar_ts == datetime(2024, 1, 1, 13, 0)
 
 
-    # Re-add the old test that was replaced
     def _placeholder(self):
         pass
+
+
+class TestP0LiveSafetyHardening:
+    """P0 live safety hardening tests."""
+
+    def test_exit_uses_reduce_only_to_prevent_reversal(self, tmp_path):
+        """P0-1: exit SELL must use reduceOnly=true so it can't open short."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+
+        # Mock _place_reduce_only_order (the new method)
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
+        })
+        svc._place_market_order = MagicMock()
+
+        with patch("execution.live_service.cancel_all_orders"):
+            with patch("execution.live_service.fetch_position", return_value=None):
+                svc._handle_exit(_bar(), "time_stop")
+
+        # Must use reduceOnly, not regular market order
+        svc._place_reduce_only_order.assert_called_once_with("SELL", 0.3)
+        svc._place_market_order.assert_not_called()
+        assert svc.has_live_position is False
+
+    def test_exit_expired_reduce_only_checks_exchange(self, tmp_path):
+        """P0-1: if reduceOnly SELL expires (position already closed by
+        catastrophe), verify with exchange before assuming flat."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "EXPIRED",
+        })
+
+        with patch("execution.live_service.cancel_all_orders"):
+            with patch("execution.live_service.fetch_position", return_value=None):
+                svc._handle_exit(_bar(), "time_stop")
+
+        # Position was already closed → confirmed flat
+        assert svc.has_live_position is False
+
+    def test_exit_verifies_zero_position_after_fill(self, tmp_path):
+        """P0-3: after SELL FILLED, verify exchange position is zero."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
+        })
+
+        # Exchange still shows residual position
+        mock_pos = {"positionAmt": "0.01"}
+        with patch("execution.live_service.cancel_all_orders"):
+            with patch("execution.live_service.fetch_position",
+                       return_value=mock_pos):
+                svc._handle_exit(_bar(), "time_stop")
+
+        assert svc.halted is True
+        assert "exit_residual" in svc.halt_reason
+
+    def test_reconcile_catastrophe_replace_fail_halts(self, tmp_path):
+        """P0-4: if catastrophe re-place fails, HALT."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.has_live_position = True
+        svc.live_catastrophe_level = 48000.0
+        svc.live_quantity = 0.3
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+
+        mock_pos = {"symbol": "BTCUSDT", "positionAmt": "0.3"}
+        mock_stop_reject = MagicMock(event_type="reject", error="margin")
+
+        with patch("execution.live_service.fetch_position", return_value=mock_pos):
+            with patch("execution.live_service.fetch_open_orders", return_value=[]):
+                with patch("execution.live_service.place_catastrophe_stop",
+                           return_value=mock_stop_reject):
+                    with patch("execution.live_service.log_stop_event"):
+                        svc._reconcile()
+
+        assert svc.halted is True
+        assert "catastrophe_replace_failed" in svc.halt_reason
+
+    def test_entry_reentrancy_guard(self, tmp_path):
+        """P0-5: duplicate entry call is blocked by reentrancy guard."""
+        svc = _make_service(tmp_path, dry_run=True)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+
+        # Simulate reentrancy by setting flag
+        svc._order_in_progress = True
+        svc._handle_entry(_bar())
+
+        # Should have been skipped — no position opened
+        assert svc.has_live_position is False
 
 

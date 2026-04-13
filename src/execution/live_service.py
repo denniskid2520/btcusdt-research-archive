@@ -99,6 +99,7 @@ class LiveService:
         # confirms zero position on the exchange.
         self.halted: bool = False
         self.halt_reason: str = ""
+        self._order_in_progress: bool = False  # P0-5: reentrancy guard
         self._restore_live_position_state()
         # P2 FIX: after restoring state, if halted, run a reconciliation
         # immediately so the halt can be cleared BEFORE the first bar
@@ -301,8 +302,24 @@ class LiveService:
                 )
                 log_stop_event(CANDIDATE_ID, evt)
                 if evt.event_type == "reject":
+                    # P0-4 FIX: if re-place fails, HALT — naked position
+                    # is too dangerous to continue trading with.
                     emit_alert(CANDIDATE_ID, "CRITICAL",
-                               f"Catastrophe re-place FAILED: {evt.error}")
+                               f"Catastrophe re-place FAILED: {evt.error} "
+                               f"— HALTING, position unprotected")
+                    self.halted = True
+                    self.halt_reason = (
+                        f"catastrophe_replace_failed: {evt.error}"
+                    )
+                    self._save_runner()
+            else:
+                # P0-4: no stop level/qty to re-place → halt
+                emit_alert(CANDIDATE_ID, "CRITICAL",
+                           "Position exists, catastrophe stop missing, "
+                           "but no stop level/qty to re-place — HALTING")
+                self.halted = True
+                self.halt_reason = "catastrophe_missing_no_replace_data"
+                self._save_runner()
 
         if not has_exchange_pos and has_cat_stop and not self.dry_run:
             self._log_tick("Orphaned stop orders found, cancelling")
@@ -421,6 +438,18 @@ class LiveService:
         self._mark_bar_processed(bar.timestamp)
 
     def _handle_entry(self, bar: MarketBar) -> None:
+        # P0-5: reentrancy guard — prevent duplicate entry from
+        # exception-retry or duplicate event
+        if self._order_in_progress:
+            self._log_tick("ENTRY SKIPPED — order already in progress")
+            return
+        self._order_in_progress = True
+        try:
+            self._handle_entry_inner(bar)
+        finally:
+            self._order_in_progress = False
+
+    def _handle_entry_inner(self, bar: MarketBar) -> None:
         equity = self._get_strategy_equity()
         if equity is None:
             self._log_tick("ENTRY SKIPPED — balance check failed")
@@ -605,6 +634,27 @@ class LiveService:
             emit_alert(CANDIDATE_ID, "CRITICAL", f"MARKET {side} failed: {e}")
             return None
 
+    def _place_reduce_only_order(self, side: str, quantity: float) -> dict | None:
+        """Place a MARKET order with reduceOnly=true.
+
+        P0-1: used for exits to prevent accidental position reversal.
+        If the position was already closed (e.g., by catastrophe stop),
+        Binance will EXPIRE or REJECT the reduceOnly order instead of
+        opening a new opposite position.
+        """
+        from execution.live_executor import _signed_request
+        try:
+            return _signed_request(
+                "POST", "/fapi/v1/order",
+                {"symbol": "BTCUSDT", "side": side, "type": "MARKET",
+                 "quantity": f"{quantity:.3f}", "reduceOnly": "true"},
+                self.api_key, self.api_secret,
+            )
+        except Exception as e:
+            emit_alert(CANDIDATE_ID, "CRITICAL",
+                       f"MARKET {side} (reduceOnly) failed: {e}")
+            return None
+
     def _handle_exit(self, bar: MarketBar, reason: str) -> None:
         self._log_tick(f"EXIT: {reason}")
         self._log_event({
@@ -622,28 +672,79 @@ class LiveService:
             self.open_catastrophe_order_id = None
             return
 
-        # P0 FIX: actually submit the SELL order before clearing state.
-        # Cancel catastrophe stop first (avoid double-close if it triggers
-        # simultaneously with our market exit).
-        cancel_all_orders(self.api_key, self.api_secret)
-
-        self._log_tick(f"Placing MARKET SELL qty={self.live_quantity:.4f}...")
-        exit_evt = self._place_market_order("SELL", self.live_quantity)
+        # P0-1 FIX: send SELL first with reduceOnly=true, THEN cancel
+        # catastrophe stop. This prevents the race where:
+        #   cancel_all_orders removes catastrophe → catastrophe fill
+        #   already in-flight → our SELL creates a NEW short position.
+        # With reduceOnly=true on the SELL, even if catastrophe already
+        # closed the position, the SELL will be rejected (not open short).
+        self._log_tick(f"Placing MARKET SELL (reduceOnly) qty={self.live_quantity:.4f}...")
+        exit_evt = self._place_reduce_only_order("SELL", self.live_quantity)
 
         exit_ok = (
             exit_evt is not None
             and exit_evt.get("status") == "FILLED"
         )
+
+        # P0-6 FIX: cancel catastrophe stop AFTER SELL, and log if cancel fails.
+        try:
+            cancel_all_orders(self.api_key, self.api_secret)
+        except Exception as e:
+            emit_alert(CANDIDATE_ID, "WARN",
+                       f"cancel_all_orders after exit failed: {e}")
+
         if exit_ok:
             fill_price = float(exit_evt.get("avgPrice", bar.open))
-            self._log_tick(f"Exit FILLED: price={fill_price:.2f}")
+            fill_qty = float(exit_evt.get("executedQty", 0))
+            self._log_tick(f"Exit FILLED: price={fill_price:.2f} qty={fill_qty:.4f}")
+
+            # P0-3 FIX: verify exchange position is zero after exit.
+            try:
+                pos = fetch_position(self.api_key, self.api_secret)
+                pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
+                if abs(pos_amt) > 0.0001:
+                    emit_alert(CANDIDATE_ID, "CRITICAL",
+                               f"Exit FILLED but position still {pos_amt} — "
+                               f"HALTING for manual review")
+                    self.halted = True
+                    self.halt_reason = f"exit_residual_position: {pos_amt}"
+                    self.live_quantity = abs(pos_amt)
+                    self._save_runner()
+                    return
+            except Exception as e:
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"Post-exit position verify failed: {e}")
+                # Proceed cautiously — SELL was FILLED so likely flat
+
             self.has_live_position = False
             self.live_entry_price = 0.0
             self.live_quantity = 0.0
             self.open_catastrophe_order_id = None
+        elif exit_evt is not None and exit_evt.get("status") == "EXPIRED":
+            # reduceOnly SELL expired = position was already closed
+            # (catastrophe stop likely triggered before our SELL).
+            # Verify with exchange and clear if truly flat.
+            self._log_tick("Exit SELL expired (reduceOnly) — position may already be closed")
+            try:
+                pos = fetch_position(self.api_key, self.api_secret)
+                pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
+                if abs(pos_amt) < 0.0001:
+                    self._log_tick("Confirmed flat after EXPIRED SELL")
+                    self.has_live_position = False
+                    self.live_entry_price = 0.0
+                    self.live_quantity = 0.0
+                    self.open_catastrophe_order_id = None
+                    return
+            except Exception:
+                pass
+            # Can't confirm flat — halt
+            emit_alert(CANDIDATE_ID, "CRITICAL",
+                       "Exit SELL EXPIRED but cannot confirm flat — HALTING")
+            self.halted = True
+            self.halt_reason = "exit_sell_expired_unverified"
+            self._save_runner()
         else:
             # Exit failed — position may still be open on exchange.
-            # Do NOT clear internal state. Mark halted for reconciliation.
             status = exit_evt.get("status", "None") if exit_evt else "None"
             emit_alert(CANDIDATE_ID, "CRITICAL",
                        f"Exit SELL failed (status={status}) — "
