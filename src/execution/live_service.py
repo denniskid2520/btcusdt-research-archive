@@ -98,11 +98,12 @@ class LiveService:
         self._restore_live_position_state()
 
     def _restore_live_position_state(self) -> None:
-        """FIX 2: restore live-position fields from persisted state.json.
+        """Restore live-position fields from state.json, then cross-check
+        against exchange state.
 
-        On startup (or restart), if a live position was open when the
-        process last saved, we must restore all tracking fields so the
-        service can continue managing the position correctly.
+        CODEX FIX 3: if state.json says has_live_position=True but the
+        exchange shows no position (e.g., catastrophe stop triggered while
+        service was down), clear the flag so new entries aren't blocked.
         """
         state_file = self.state_dir / "state.json"
         if not state_file.exists():
@@ -115,14 +116,46 @@ class LiveService:
             self.live_alpha_level = saved.get("live_alpha_level", 0.0)
             self.live_catastrophe_level = saved.get("live_catastrophe_level", 0.0)
             self.open_catastrophe_order_id = saved.get("open_catastrophe_order_id")
-            if self.has_live_position:
-                self._log_tick(
-                    f"Restored live position: entry={self.live_entry_price:.2f} "
-                    f"qty={self.live_quantity:.4f} alpha={self.live_alpha_level:.2f} "
-                    f"cat={self.live_catastrophe_level:.2f}"
-                )
         except Exception as e:
             emit_alert(CANDIDATE_ID, "WARN", f"Failed to restore live position: {e}")
+            return
+
+        if not self.has_live_position:
+            return
+
+        self._log_tick(
+            f"Restored live position: entry={self.live_entry_price:.2f} "
+            f"qty={self.live_quantity:.4f}"
+        )
+
+        # Cross-check with exchange — don't blindly trust state.json
+        if not self.dry_run and self.api_key:
+            try:
+                exchange_pos = fetch_position(self.api_key, self.api_secret)
+                has_exchange_pos = (
+                    exchange_pos is not None
+                    and float(exchange_pos.get("positionAmt", 0)) != 0
+                )
+                if not has_exchange_pos:
+                    self._log_tick(
+                        "WARN: state.json says position open but exchange "
+                        "shows flat — clearing internal position flag"
+                    )
+                    emit_alert(CANDIDATE_ID, "WARN",
+                               "Position closed while service was down "
+                               "(likely catastrophe stop triggered). "
+                               "Clearing internal position flag.")
+                    self.has_live_position = False
+                    self.live_entry_price = 0.0
+                    self.live_quantity = 0.0
+                    self.open_catastrophe_order_id = None
+                    self._save_runner()
+                else:
+                    self._log_tick("Exchange confirms position still open")
+            except Exception as e:
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"Could not verify position on startup: {e}. "
+                           f"Trusting state.json.")
 
     def _load_runner(self) -> PaperRunnerV2:
         runner = PaperRunnerV2(self.candidate_cfg)
@@ -352,16 +385,33 @@ class LiveService:
             self.live_catastrophe_level = cat_level
             return
 
-        # FIX 1: submit entry order BEFORE marking position open.
-        # Internal OPEN state must only be set after exchange confirms.
+        # Submit entry order BEFORE marking position open.
+        # Internal OPEN state must only be set after exchange confirms FILLED.
         self._log_tick("Placing MARKET BUY...")
         entry_evt = self._place_market_order("BUY", quantity)
-        if entry_evt is None or entry_evt.get("status") == "REJECTED":
+
+        # CODEX FIX 1: require explicit FILLED status, not just "not REJECTED".
+        # A NEW or PARTIALLY_FILLED response means the order isn't done yet —
+        # we must not derive fill_price/fill_qty from incomplete data.
+        if entry_evt is None:
             emit_alert(CANDIDATE_ID, "CRITICAL",
-                       f"Entry order REJECTED — not opening position")
+                       "Entry order returned None — not opening position")
             return
+        entry_status = entry_evt.get("status", "UNKNOWN")
+        if entry_status != "FILLED":
+            emit_alert(CANDIDATE_ID, "CRITICAL",
+                       f"Entry order status={entry_status} (expected FILLED) — "
+                       f"not opening position, cancelling any partial")
+            # Cancel in case it's partially filled / still NEW
+            cancel_all_orders(self.api_key, self.api_secret)
+            return
+
         fill_price = float(entry_evt.get("avgPrice", price))
         fill_qty = float(entry_evt.get("executedQty", quantity))
+        if fill_qty <= 0:
+            emit_alert(CANDIDATE_ID, "CRITICAL",
+                       f"Entry FILLED but executedQty={fill_qty} — aborting")
+            return
         self._log_tick(f"Entry FILLED: price={fill_price:.2f} qty={fill_qty:.4f}")
 
         # Recompute stop levels from actual fill price
@@ -375,9 +425,28 @@ class LiveService:
         )
         log_stop_event(CANDIDATE_ID, evt)
         if evt.event_type == "reject":
+            # CODEX FIX 2: verify emergency flatten succeeds.
+            # If SELL also fails, mark position as live so reconciliation
+            # can detect and handle the naked position.
             emit_alert(CANDIDATE_ID, "CRITICAL",
                        f"Catastrophe stop REJECTED: {evt.error} — FLATTENING")
-            self._place_market_order("SELL", fill_qty)
+            flatten_evt = self._place_market_order("SELL", fill_qty)
+            flatten_ok = (
+                flatten_evt is not None
+                and flatten_evt.get("status") == "FILLED"
+            )
+            if not flatten_ok:
+                # Flatten failed — we have a NAKED LIVE POSITION.
+                # Mark it as open so _reconcile() can detect and re-attempt.
+                emit_alert(CANDIDATE_ID, "CRITICAL",
+                           "EMERGENCY FLATTEN FAILED — naked position, "
+                           "manual intervention required")
+                self.has_live_position = True
+                self.live_entry_price = fill_price
+                self.live_quantity = fill_qty
+                self.live_alpha_level = alpha_level
+                self.live_catastrophe_level = cat_level
+                self._save_runner()
             return
         self.open_catastrophe_order_id = evt.order_id
 
