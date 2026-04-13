@@ -112,20 +112,81 @@ class TestFix1EntryOrderBeforeStateFlip:
 
         assert svc.has_live_position is False
 
-    def test_live_partial_fill_does_not_set_position(self, tmp_path):
-        """CODEX FIX 1: PARTIALLY_FILLED must NOT proceed."""
+    def test_live_partial_fill_flattens_and_confirms_zero(self, tmp_path):
+        """PARTIALLY_FILLED with qty > 0 must flatten + verify zero."""
         svc = _make_service(tmp_path, dry_run=False)
         svc._get_strategy_equity = MagicMock(return_value=10000.0)
         svc._log_tick = MagicMock()
         svc._log_event = MagicMock()
-        svc._place_market_order = MagicMock(return_value={
-            "status": "PARTIALLY_FILLED", "avgPrice": "50000", "executedQty": "0.1",
-        })
+        # First call = entry BUY (PARTIALLY_FILLED, 0.1 executed)
+        # Second call = flatten SELL (FILLED)
+        svc._place_market_order = MagicMock(side_effect=[
+            {"status": "PARTIALLY_FILLED", "avgPrice": "50000", "executedQty": "0.1"},
+            {"status": "FILLED", "avgPrice": "49950", "executedQty": "0.1"},
+        ])
+
+        with patch("execution.live_service.cancel_all_orders"):
+            with patch("execution.live_service.fetch_position", return_value={"positionAmt": "0"}):
+                svc._handle_entry(_bar(price=50000.0))
+
+        assert svc.has_live_position is False
+        # BUY + SELL = 2 calls
+        assert svc._place_market_order.call_count == 2
+        assert svc._place_market_order.call_args_list[1][0][0] == "SELL"
+
+    def test_live_partial_fill_flatten_fails_marks_naked(self, tmp_path):
+        """If partial fill flatten fails, mark naked for manual intervention."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+        # BUY partial, SELL fails
+        svc._place_market_order = MagicMock(side_effect=[
+            {"status": "PARTIALLY_FILLED", "avgPrice": "50000", "executedQty": "0.1"},
+            None,  # flatten fails
+        ])
 
         with patch("execution.live_service.cancel_all_orders"):
             svc._handle_entry(_bar(price=50000.0))
 
-        assert svc.has_live_position is False
+        # Must be marked as live (naked) for reconciliation
+        assert svc.has_live_position is True
+        assert svc.live_quantity == 0.1
+
+    def test_live_partial_fill_flatten_ok_but_position_remains(self, tmp_path):
+        """If flatten SELL reports FILLED but exchange still shows position,
+        mark as live for manual intervention."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+        svc._place_market_order = MagicMock(side_effect=[
+            {"status": "PARTIALLY_FILLED", "avgPrice": "50000", "executedQty": "0.1"},
+            {"status": "FILLED", "avgPrice": "49950", "executedQty": "0.1"},
+        ])
+
+        with patch("execution.live_service.cancel_all_orders"):
+            # Exchange still shows 0.05 remaining
+            with patch("execution.live_service.fetch_position",
+                       return_value={"positionAmt": "0.05"}):
+                svc._handle_entry(_bar(price=50000.0))
+
+        assert svc.has_live_position is True
+        assert svc.live_quantity == 0.05
 
     def test_live_successful_entry_sets_position_after_fill(self, tmp_path):
         """Position is set only AFTER exchange confirms FILLED + stop ack."""

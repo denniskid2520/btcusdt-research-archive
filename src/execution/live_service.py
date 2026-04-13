@@ -399,11 +399,57 @@ class LiveService:
             return
         entry_status = entry_evt.get("status", "UNKNOWN")
         if entry_status != "FILLED":
-            emit_alert(CANDIDATE_ID, "CRITICAL",
-                       f"Entry order status={entry_status} (expected FILLED) — "
-                       f"not opening position, cancelling any partial")
-            # Cancel in case it's partially filled / still NEW
+            # Cancel remaining open quantity first
             cancel_all_orders(self.api_key, self.api_secret)
+
+            # CODEX FIX: if PARTIALLY_FILLED with executedQty > 0, the
+            # already-filled portion is a real position on the exchange.
+            # We must flatten it and confirm zero before returning FLAT.
+            partial_qty = float(entry_evt.get("executedQty", 0))
+            if partial_qty > 0:
+                emit_alert(CANDIDATE_ID, "CRITICAL",
+                           f"Entry {entry_status} with executedQty={partial_qty} "
+                           f"— cancelling remainder and flattening filled qty")
+                flatten_evt = self._place_market_order("SELL", partial_qty)
+                flatten_ok = (
+                    flatten_evt is not None
+                    and flatten_evt.get("status") == "FILLED"
+                )
+                if flatten_ok:
+                    # Verify exchange position is actually zero
+                    try:
+                        pos = fetch_position(self.api_key, self.api_secret)
+                        pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
+                        if abs(pos_amt) > 0.0001:
+                            emit_alert(CANDIDATE_ID, "CRITICAL",
+                                       f"Flatten sent but position still "
+                                       f"{pos_amt} — HALT, manual intervention")
+                            self.has_live_position = True
+                            self.live_entry_price = float(
+                                entry_evt.get("avgPrice", price))
+                            self.live_quantity = abs(pos_amt)
+                            self._save_runner()
+                            return
+                    except Exception as e:
+                        emit_alert(CANDIDATE_ID, "WARN",
+                                   f"Could not verify zero position: {e}")
+                    self._log_tick("Partial fill flattened and confirmed zero")
+                else:
+                    # Flatten failed — naked partial position
+                    emit_alert(CANDIDATE_ID, "CRITICAL",
+                               f"PARTIAL FILL FLATTEN FAILED — "
+                               f"executedQty={partial_qty} still on exchange, "
+                               f"HALT, manual intervention required")
+                    self.has_live_position = True
+                    self.live_entry_price = float(
+                        entry_evt.get("avgPrice", price))
+                    self.live_quantity = partial_qty
+                    self._save_runner()
+                    return
+            else:
+                emit_alert(CANDIDATE_ID, "CRITICAL",
+                           f"Entry order status={entry_status} with zero qty "
+                           f"— cancelled, staying flat")
             return
 
         fill_price = float(entry_evt.get("avgPrice", price))
