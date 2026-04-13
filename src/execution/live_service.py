@@ -86,14 +86,43 @@ class LiveService:
 
         self.runner = self._load_runner()
         self.last_bar_ts: datetime | None = self._load_last_bar_ts()
-        self.open_catastrophe_order_id: str | None = None
 
-        # Track live position state
+        # FIX 2: restore persisted live-position fields from state.json
+        # so a restart during an open trade doesn't lose position tracking.
         self.has_live_position = False
         self.live_entry_price: float = 0.0
         self.live_quantity: float = 0.0
         self.live_alpha_level: float = 0.0
         self.live_catastrophe_level: float = 0.0
+        self.open_catastrophe_order_id: str | None = None
+        self._restore_live_position_state()
+
+    def _restore_live_position_state(self) -> None:
+        """FIX 2: restore live-position fields from persisted state.json.
+
+        On startup (or restart), if a live position was open when the
+        process last saved, we must restore all tracking fields so the
+        service can continue managing the position correctly.
+        """
+        state_file = self.state_dir / "state.json"
+        if not state_file.exists():
+            return
+        try:
+            saved = json.loads(state_file.read_text())
+            self.has_live_position = saved.get("has_live_position", False)
+            self.live_entry_price = saved.get("live_entry_price", 0.0)
+            self.live_quantity = saved.get("live_quantity", 0.0)
+            self.live_alpha_level = saved.get("live_alpha_level", 0.0)
+            self.live_catastrophe_level = saved.get("live_catastrophe_level", 0.0)
+            self.open_catastrophe_order_id = saved.get("open_catastrophe_order_id")
+            if self.has_live_position:
+                self._log_tick(
+                    f"Restored live position: entry={self.live_entry_price:.2f} "
+                    f"qty={self.live_quantity:.4f} alpha={self.live_alpha_level:.2f} "
+                    f"cat={self.live_catastrophe_level:.2f}"
+                )
+        except Exception as e:
+            emit_alert(CANDIDATE_ID, "WARN", f"Failed to restore live position: {e}")
 
     def _load_runner(self) -> PaperRunnerV2:
         runner = PaperRunnerV2(self.candidate_cfg)
@@ -129,8 +158,12 @@ class LiveService:
                 "next_zone_id": self.runner.state.next_zone_id,
                 "bars_since_last_exit": self.runner.state.bars_since_last_exit,
                 "trade_count": len(self.runner.trades),
+                # FIX 2: persist ALL live-position fields for restart recovery
                 "has_live_position": self.has_live_position,
                 "live_entry_price": self.live_entry_price,
+                "live_quantity": self.live_quantity,
+                "live_alpha_level": self.live_alpha_level,
+                "live_catastrophe_level": self.live_catastrophe_level,
                 "open_catastrophe_order_id": self.open_catastrophe_order_id,
             }, indent=2, default=str),
         )
@@ -186,8 +219,19 @@ class LiveService:
             return
 
         has_exchange_pos = pos is not None and float(pos.get("positionAmt", 0)) != 0
+        # FIX 3: Binance API may return reduceOnly as boolean True or
+        # string "true" depending on the endpoint / library version.
+        # Handle both by normalizing to a truthy check.
+        def _is_reduce_only(o: dict) -> bool:
+            val = o.get("reduceOnly", False)
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.lower() == "true"
+            return bool(val)
+
         has_cat_stop = any(
-            o.get("type") == "STOP_MARKET" and o.get("reduceOnly", "") == "true"
+            o.get("type") == "STOP_MARKET" and _is_reduce_only(o)
             for o in orders
         )
 
@@ -299,30 +343,64 @@ class LiveService:
             "dry_run": self.dry_run,
         })
 
-        if not self.dry_run:
-            # Place MARKET entry order
-            self._log_tick("Placing MARKET BUY...")
-            # (order placement code would go here)
-            # For now, log the intent
+        if self.dry_run:
+            # Dry-run: no real orders, just mark position open
+            self.has_live_position = True
+            self.live_entry_price = price
+            self.live_quantity = quantity
+            self.live_alpha_level = alpha_level
+            self.live_catastrophe_level = cat_level
+            return
 
-            # Place catastrophe STOP_MARKET
-            self._log_tick(f"Placing catastrophe STOP_MARKET at {cat_level:.2f}...")
-            evt = place_catastrophe_stop(
-                self.api_key, self.api_secret, "long", cat_level, quantity,
-            )
-            log_stop_event(CANDIDATE_ID, evt)
-            if evt.event_type == "reject":
-                emit_alert(CANDIDATE_ID, "CRITICAL",
-                           f"Catastrophe stop REJECTED: {evt.error} — HALTING")
-                # Flatten position and halt
-                return
-            self.open_catastrophe_order_id = evt.order_id
+        # FIX 1: submit entry order BEFORE marking position open.
+        # Internal OPEN state must only be set after exchange confirms.
+        self._log_tick("Placing MARKET BUY...")
+        entry_evt = self._place_market_order("BUY", quantity)
+        if entry_evt is None or entry_evt.get("status") == "REJECTED":
+            emit_alert(CANDIDATE_ID, "CRITICAL",
+                       f"Entry order REJECTED — not opening position")
+            return
+        fill_price = float(entry_evt.get("avgPrice", price))
+        fill_qty = float(entry_evt.get("executedQty", quantity))
+        self._log_tick(f"Entry FILLED: price={fill_price:.2f} qty={fill_qty:.4f}")
 
+        # Recompute stop levels from actual fill price
+        alpha_level = fill_price * (1 - self.candidate_cfg.alpha_stop_pct)
+        cat_level = fill_price * (1 - self.candidate_cfg.catastrophe_stop_pct)
+
+        # Place catastrophe STOP_MARKET
+        self._log_tick(f"Placing catastrophe STOP_MARKET at {cat_level:.2f}...")
+        evt = place_catastrophe_stop(
+            self.api_key, self.api_secret, "long", cat_level, fill_qty,
+        )
+        log_stop_event(CANDIDATE_ID, evt)
+        if evt.event_type == "reject":
+            emit_alert(CANDIDATE_ID, "CRITICAL",
+                       f"Catastrophe stop REJECTED: {evt.error} — FLATTENING")
+            self._place_market_order("SELL", fill_qty)
+            return
+        self.open_catastrophe_order_id = evt.order_id
+
+        # NOW mark position open — exchange has confirmed both orders
         self.has_live_position = True
-        self.live_entry_price = price
-        self.live_quantity = quantity
+        self.live_entry_price = fill_price
+        self.live_quantity = fill_qty
         self.live_alpha_level = alpha_level
         self.live_catastrophe_level = cat_level
+
+    def _place_market_order(self, side: str, quantity: float) -> dict | None:
+        """Place a MARKET order on Binance and return the response."""
+        from execution.live_executor import _signed_request
+        try:
+            return _signed_request(
+                "POST", "/fapi/v1/order",
+                {"symbol": "BTCUSDT", "side": side, "type": "MARKET",
+                 "quantity": f"{quantity:.3f}"},
+                self.api_key, self.api_secret,
+            )
+        except Exception as e:
+            emit_alert(CANDIDATE_ID, "CRITICAL", f"MARKET {side} failed: {e}")
+            return None
 
     def _handle_exit(self, bar: MarketBar, reason: str) -> None:
         self._log_tick(f"EXIT: {reason}")
