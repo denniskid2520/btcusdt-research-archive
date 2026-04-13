@@ -323,7 +323,10 @@ class LiveService:
 
         if not has_exchange_pos and has_cat_stop and not self.dry_run:
             self._log_tick("Orphaned stop orders found, cancelling")
-            cancel_all_orders(self.api_key, self.api_secret)
+            cr = cancel_all_orders(self.api_key, self.api_secret)
+            if not cr.get("ok"):
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"Orphan stop cancel failed: {cr.get('error')}")
 
         # If halted due to position_unknown, check if exchange now
         # confirms zero → clear halt and allow new entries.
@@ -500,7 +503,10 @@ class LiveService:
         entry_status = entry_evt.get("status", "UNKNOWN")
         if entry_status != "FILLED":
             # Cancel remaining open quantity first
-            cancel_all_orders(self.api_key, self.api_secret)
+            cr = cancel_all_orders(self.api_key, self.api_secret)
+            if not cr.get("ok"):
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"Entry cancel failed: {cr.get('error')}")
 
             # CODEX FIX: if PARTIALLY_FILLED with executedQty > 0, the
             # already-filled portion is a real position on the exchange.
@@ -621,13 +627,19 @@ class LiveService:
         self.live_catastrophe_level = cat_level
 
     def _place_market_order(self, side: str, quantity: float) -> dict | None:
-        """Place a MARKET order on Binance and return the response."""
+        """Place a MARKET order on Binance and return the response.
+
+        Uses newOrderRespType=RESULT so the response includes
+        status=FILLED, executedQty, and avgPrice for MARKET orders.
+        Without this, Binance may return status=NEW with no fill data.
+        """
         from execution.live_executor import _signed_request
         try:
             return _signed_request(
                 "POST", "/fapi/v1/order",
                 {"symbol": "BTCUSDT", "side": side, "type": "MARKET",
-                 "quantity": f"{quantity:.3f}"},
+                 "quantity": f"{quantity:.3f}",
+                 "newOrderRespType": "RESULT"},
                 self.api_key, self.api_secret,
             )
         except Exception as e:
@@ -637,7 +649,7 @@ class LiveService:
     def _place_reduce_only_order(self, side: str, quantity: float) -> dict | None:
         """Place a MARKET order with reduceOnly=true.
 
-        P0-1: used for exits to prevent accidental position reversal.
+        Uses newOrderRespType=RESULT for reliable fill data.
         If the position was already closed (e.g., by catastrophe stop),
         Binance will EXPIRE or REJECT the reduceOnly order instead of
         opening a new opposite position.
@@ -647,7 +659,8 @@ class LiveService:
             return _signed_request(
                 "POST", "/fapi/v1/order",
                 {"symbol": "BTCUSDT", "side": side, "type": "MARKET",
-                 "quantity": f"{quantity:.3f}", "reduceOnly": "true"},
+                 "quantity": f"{quantity:.3f}", "reduceOnly": "true",
+                 "newOrderRespType": "RESULT"},
                 self.api_key, self.api_secret,
             )
         except Exception as e:
@@ -672,12 +685,8 @@ class LiveService:
             self.open_catastrophe_order_id = None
             return
 
-        # P0-1 FIX: send SELL first with reduceOnly=true, THEN cancel
-        # catastrophe stop. This prevents the race where:
-        #   cancel_all_orders removes catastrophe → catastrophe fill
-        #   already in-flight → our SELL creates a NEW short position.
-        # With reduceOnly=true on the SELL, even if catastrophe already
-        # closed the position, the SELL will be rejected (not open short).
+        # Send reduceOnly SELL first. Do NOT cancel catastrophe stop yet —
+        # if the SELL fails, the catastrophe stop is our last line of defense.
         self._log_tick(f"Placing MARKET SELL (reduceOnly) qty={self.live_quantity:.4f}...")
         exit_evt = self._place_reduce_only_order("SELL", self.live_quantity)
 
@@ -686,19 +695,20 @@ class LiveService:
             and exit_evt.get("status") == "FILLED"
         )
 
-        # P0-6 FIX: cancel catastrophe stop AFTER SELL, and log if cancel fails.
-        try:
-            cancel_all_orders(self.api_key, self.api_secret)
-        except Exception as e:
-            emit_alert(CANDIDATE_ID, "WARN",
-                       f"cancel_all_orders after exit failed: {e}")
-
         if exit_ok:
             fill_price = float(exit_evt.get("avgPrice", bar.open))
             fill_qty = float(exit_evt.get("executedQty", 0))
             self._log_tick(f"Exit FILLED: price={fill_price:.2f} qty={fill_qty:.4f}")
 
-            # P0-3 FIX: verify exchange position is zero after exit.
+            # NOW cancel catastrophe stop — SELL is confirmed FILLED,
+            # so position is closed and the stop is orphaned.
+            cancel_result = cancel_all_orders(self.api_key, self.api_secret)
+            if not cancel_result.get("ok"):
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"cancel_all_orders after FILLED exit failed: "
+                           f"{cancel_result.get('error')}")
+
+            # Verify exchange position is zero after exit.
             try:
                 pos = fetch_position(self.api_key, self.api_secret)
                 pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
@@ -714,22 +724,26 @@ class LiveService:
             except Exception as e:
                 emit_alert(CANDIDATE_ID, "WARN",
                            f"Post-exit position verify failed: {e}")
-                # Proceed cautiously — SELL was FILLED so likely flat
 
             self.has_live_position = False
             self.live_entry_price = 0.0
             self.live_quantity = 0.0
             self.open_catastrophe_order_id = None
-        elif exit_evt is not None and exit_evt.get("status") == "EXPIRED":
-            # reduceOnly SELL expired = position was already closed
+
+        elif exit_evt is not None and exit_evt.get("status") in ("EXPIRED", "REJECTED"):
+            # reduceOnly SELL expired/rejected = position was already closed
             # (catastrophe stop likely triggered before our SELL).
-            # Verify with exchange and clear if truly flat.
-            self._log_tick("Exit SELL expired (reduceOnly) — position may already be closed")
+            # Also handle REJECTED with error code -2022 (reduceOnly no position).
+            self._log_tick(
+                f"Exit SELL {exit_evt.get('status')} (reduceOnly) — "
+                f"position may already be closed")
             try:
                 pos = fetch_position(self.api_key, self.api_secret)
                 pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
                 if abs(pos_amt) < 0.0001:
-                    self._log_tick("Confirmed flat after EXPIRED SELL")
+                    self._log_tick("Confirmed flat after EXPIRED/REJECTED SELL")
+                    # Cancel orphaned stop orders if any
+                    cancel_all_orders(self.api_key, self.api_secret)
                     self.has_live_position = False
                     self.live_entry_price = 0.0
                     self.live_quantity = 0.0
@@ -737,18 +751,23 @@ class LiveService:
                     return
             except Exception:
                 pass
-            # Can't confirm flat — halt
+            # Can't confirm flat — halt. DO NOT cancel catastrophe stop
+            # (it may be the only protection left).
             emit_alert(CANDIDATE_ID, "CRITICAL",
-                       "Exit SELL EXPIRED but cannot confirm flat — HALTING")
+                       f"Exit SELL {exit_evt.get('status')} but cannot "
+                       f"confirm flat — HALTING (catastrophe stop preserved)")
             self.halted = True
-            self.halt_reason = "exit_sell_expired_unverified"
+            self.halt_reason = f"exit_sell_{exit_evt.get('status','unknown')}_unverified"
             self._save_runner()
+
         else:
             # Exit failed — position may still be open on exchange.
+            # DO NOT cancel catastrophe stop — it's the last protection.
             status = exit_evt.get("status", "None") if exit_evt else "None"
             emit_alert(CANDIDATE_ID, "CRITICAL",
                        f"Exit SELL failed (status={status}) — "
-                       f"position may still be open, HALTING")
+                       f"position may still be open, HALTING "
+                       f"(catastrophe stop preserved)")
             self.halted = True
             self.halt_reason = f"exit_sell_failed: status={status}"
             self._save_runner()

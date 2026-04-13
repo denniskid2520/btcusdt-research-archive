@@ -110,7 +110,7 @@ class TestFix1EntryOrderBeforeStateFlip:
             "status": "NEW", "avgPrice": "0", "executedQty": "0",
         })
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             svc._handle_entry(_bar(price=50000.0))
 
         assert svc.has_live_position is False
@@ -128,7 +128,7 @@ class TestFix1EntryOrderBeforeStateFlip:
             {"status": "FILLED", "avgPrice": "49950", "executedQty": "0.1"},
         ])
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             with patch("execution.live_service.fetch_position", return_value={"positionAmt": "0"}):
                 svc._handle_entry(_bar(price=50000.0))
 
@@ -156,7 +156,7 @@ class TestFix1EntryOrderBeforeStateFlip:
             None,  # flatten fails
         ])
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             svc._handle_entry(_bar(price=50000.0))
 
         # Must be marked as live (naked) for reconciliation
@@ -182,7 +182,7 @@ class TestFix1EntryOrderBeforeStateFlip:
             {"status": "FILLED", "avgPrice": "49950", "executedQty": "0.1"},
         ])
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             with patch("execution.live_service.fetch_position",
                        side_effect=Exception("network timeout")):
                 svc._handle_entry(_bar(price=50000.0))
@@ -290,7 +290,7 @@ class TestFix1EntryOrderBeforeStateFlip:
             {"status": "FILLED", "avgPrice": "49950", "executedQty": "0.1"},
         ])
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             # Exchange still shows 0.05 remaining
             with patch("execution.live_service.fetch_position",
                        return_value={"positionAmt": "0.05"}):
@@ -585,7 +585,7 @@ class TestP0ExitOrder:
         svc._place_reduce_only_order = MagicMock(return_value={
             "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
         })
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             with patch("execution.live_service.fetch_position", return_value=None):
                 svc._handle_exit(_bar(), "time_stop")
         assert svc.has_live_position is False
@@ -607,7 +607,7 @@ class TestP0ExitOrder:
         svc.runner.state.bars_since_last_exit = 5
         svc.runner.trades = []
         svc._place_reduce_only_order = MagicMock(return_value=None)
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             svc._handle_exit(_bar(), "time_stop")
         assert svc.has_live_position is True
         assert svc.halted is True
@@ -630,7 +630,7 @@ class TestP0ExitOrder:
         svc._place_reduce_only_order = MagicMock(return_value={
             "status": "NEW", "avgPrice": "0", "executedQty": "0",
         })
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             svc._handle_exit(_bar(), "alpha_stop")
         assert svc.has_live_position is True
         assert svc.halted is True
@@ -740,7 +740,7 @@ class TestP1MissedBarCatchUp:
 
         bar = _bar(price=50100.0)
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             with patch("execution.live_service.fetch_position", return_value=None):
                 svc._handle_exit(bar, "time_stop")
 
@@ -806,7 +806,7 @@ class TestP1MissedBarCatchUp:
         svc.runner.trades = []
         svc._place_reduce_only_order = MagicMock(return_value=None)
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             svc._handle_exit(_bar(), "time_stop")
 
         assert svc.halted is True
@@ -936,7 +936,7 @@ class TestP0LiveSafetyHardening:
         })
         svc._place_market_order = MagicMock()
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             with patch("execution.live_service.fetch_position", return_value=None):
                 svc._handle_exit(_bar(), "time_stop")
 
@@ -957,7 +957,7 @@ class TestP0LiveSafetyHardening:
             "status": "EXPIRED",
         })
 
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             with patch("execution.live_service.fetch_position", return_value=None):
                 svc._handle_exit(_bar(), "time_stop")
 
@@ -984,7 +984,7 @@ class TestP0LiveSafetyHardening:
 
         # Exchange still shows residual position
         mock_pos = {"positionAmt": "0.01"}
-        with patch("execution.live_service.cancel_all_orders"):
+        with patch("execution.live_service.cancel_all_orders", return_value={"ok": True}):
             with patch("execution.live_service.fetch_position",
                        return_value=mock_pos):
                 svc._handle_exit(_bar(), "time_stop")
@@ -1028,11 +1028,116 @@ class TestP0LiveSafetyHardening:
         svc._log_event = MagicMock()
         svc._get_strategy_equity = MagicMock(return_value=10000.0)
 
-        # Simulate reentrancy by setting flag
         svc._order_in_progress = True
         svc._handle_entry(_bar())
 
-        # Should have been skipped — no position opened
+        assert svc.has_live_position is False
+
+    def test_entry_reentrancy_flag_resets_on_exception(self, tmp_path):
+        """P0-5 (GPT Pro): exception in _handle_entry_inner must
+        reset _order_in_progress flag via try/finally."""
+        svc = _make_service(tmp_path, dry_run=True)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._get_strategy_equity = MagicMock(side_effect=RuntimeError("boom"))
+
+        try:
+            svc._handle_entry(_bar())
+        except RuntimeError:
+            pass
+
+        # Flag must be reset even after exception
+        assert svc._order_in_progress is False
+
+    def test_reconcile_missing_stop_no_level_data_halts(self, tmp_path):
+        """P0-4 (GPT Pro): position exists, stop missing, but no
+        stop level/qty to re-place → HALT."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.has_live_position = True
+        svc.live_catastrophe_level = 0.0  # no level!
+        svc.live_quantity = 0.0            # no qty!
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+
+        mock_pos = {"symbol": "BTCUSDT", "positionAmt": "0.3"}
+        with patch("execution.live_service.fetch_position", return_value=mock_pos):
+            with patch("execution.live_service.fetch_open_orders", return_value=[]):
+                svc._reconcile()
+
+        assert svc.halted is True
+        assert "catastrophe_missing_no_replace_data" in svc.halt_reason
+
+    def test_cancel_all_orders_failure_visible_to_caller(self, tmp_path):
+        """P0-6 (GPT Pro): cancel_all_orders must return failure,
+        not silently swallow it."""
+        from execution.live_executor import cancel_all_orders
+        with patch("execution.live_executor._signed_request",
+                   side_effect=Exception("network error")):
+            result = cancel_all_orders("key", "secret")
+        assert result["ok"] is False
+        assert "network error" in result["error"]
+
+    def test_cancel_all_orders_success_returns_ok(self, tmp_path):
+        """P0-6: successful cancel returns ok=True."""
+        from execution.live_executor import cancel_all_orders
+        with patch("execution.live_executor._signed_request", return_value={}):
+            result = cancel_all_orders("key", "secret")
+        assert result["ok"] is True
+
+    def test_exit_only_cancels_stop_after_sell_filled(self, tmp_path):
+        """GPT Pro: catastrophe stop must NOT be cancelled until
+        SELL is confirmed FILLED. If SELL fails, stop stays as
+        last line of defense."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+
+        # SELL fails
+        svc._place_reduce_only_order = MagicMock(return_value=None)
+        cancel_mock = MagicMock(return_value={"ok": True})
+
+        with patch("execution.live_service.cancel_all_orders", cancel_mock):
+            svc._handle_exit(_bar(), "time_stop")
+
+        # cancel_all_orders must NOT have been called (stop preserved)
+        cancel_mock.assert_not_called()
+        assert svc.halted is True
+
+    def test_exit_rejected_reduce_only_checks_exchange(self, tmp_path):
+        """GPT Pro: REJECTED (not just EXPIRED) should also verify
+        exchange position before assuming flat."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "REJECTED",
+        })
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}):
+            with patch("execution.live_service.fetch_position",
+                       return_value=None):
+                svc._handle_exit(_bar(), "time_stop")
+
+        # REJECTED + exchange flat → confirmed flat
         assert svc.has_live_position is False
 
 
