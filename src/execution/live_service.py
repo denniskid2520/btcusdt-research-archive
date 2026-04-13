@@ -100,6 +100,17 @@ class LiveService:
         self.halted: bool = False
         self.halt_reason: str = ""
         self._restore_live_position_state()
+        # P2 FIX: after restoring state, if halted, run a reconciliation
+        # immediately so the halt can be cleared BEFORE the first bar
+        # is processed. Otherwise the first ENTRY_FILL after restart
+        # would be blocked even if the exchange is already flat.
+        if self.halted and not self.dry_run and self.api_key:
+            self._log_tick("Halted on startup — running immediate reconciliation...")
+            try:
+                self._reconcile()
+            except Exception as e:
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"Startup reconciliation failed: {e}")
 
     def _restore_live_position_state(self) -> None:
         """Restore live-position fields from state.json, then cross-check
@@ -577,16 +588,42 @@ class LiveService:
             "dry_run": self.dry_run,
         })
 
-        if not self.dry_run:
-            # Place MARKET SELL to close
-            self._log_tick("Placing MARKET SELL to close...")
-            # Cancel any remaining catastrophe stop
-            cancel_all_orders(self.api_key, self.api_secret)
+        if self.dry_run:
+            self.has_live_position = False
+            self.live_entry_price = 0.0
+            self.live_quantity = 0.0
+            self.open_catastrophe_order_id = None
+            return
 
-        self.has_live_position = False
-        self.live_entry_price = 0.0
-        self.live_quantity = 0.0
-        self.open_catastrophe_order_id = None
+        # P0 FIX: actually submit the SELL order before clearing state.
+        # Cancel catastrophe stop first (avoid double-close if it triggers
+        # simultaneously with our market exit).
+        cancel_all_orders(self.api_key, self.api_secret)
+
+        self._log_tick(f"Placing MARKET SELL qty={self.live_quantity:.4f}...")
+        exit_evt = self._place_market_order("SELL", self.live_quantity)
+
+        exit_ok = (
+            exit_evt is not None
+            and exit_evt.get("status") == "FILLED"
+        )
+        if exit_ok:
+            fill_price = float(exit_evt.get("avgPrice", bar.open))
+            self._log_tick(f"Exit FILLED: price={fill_price:.2f}")
+            self.has_live_position = False
+            self.live_entry_price = 0.0
+            self.live_quantity = 0.0
+            self.open_catastrophe_order_id = None
+        else:
+            # Exit failed — position may still be open on exchange.
+            # Do NOT clear internal state. Mark halted for reconciliation.
+            status = exit_evt.get("status", "None") if exit_evt else "None"
+            emit_alert(CANDIDATE_ID, "CRITICAL",
+                       f"Exit SELL failed (status={status}) — "
+                       f"position may still be open, HALTING")
+            self.halted = True
+            self.halt_reason = f"exit_sell_failed: status={status}"
+            self._save_runner()
 
     # ── main loop ───────────────────────────────────────────────
 
@@ -606,6 +643,11 @@ class LiveService:
             self._log_tick("RSI buffer short, fetching warmup bars...")
             self._warmup()
 
+        # P1 FIX: missed-bar catch-up on startup.
+        # If service was down, fetch all bars between last_processed
+        # and the current completed bar and replay them sequentially.
+        self._catch_up_missed_bars()
+
         self._log_tick("Entering polling loop...")
 
         while True:
@@ -619,8 +661,19 @@ class LiveService:
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                # New bar detected — process it
-                self._process_bar(bar)
+                # New bar detected — check for gaps first
+                if self.last_bar_ts is not None:
+                    expected_next = self.last_bar_ts + timedelta(hours=1)
+                    if bar.timestamp > expected_next:
+                        # Gap detected — catch up missed bars
+                        self._log_tick(
+                            f"Gap detected: last={self.last_bar_ts} "
+                            f"current={bar.timestamp} — catching up")
+                        self._catch_up_missed_bars()
+
+                # Process the current bar (catch-up may have already done it)
+                if self.last_bar_ts is None or bar.timestamp > self.last_bar_ts:
+                    self._process_bar(bar)
 
             except KeyboardInterrupt:
                 self._log_tick("Shutting down (KeyboardInterrupt)")
@@ -632,6 +685,67 @@ class LiveService:
                 time.sleep(30)
 
             time.sleep(POLL_INTERVAL)
+
+    def _catch_up_missed_bars(self) -> None:
+        """Fetch and replay all completed bars since last_processed_ts."""
+        if self.last_bar_ts is None:
+            return
+        try:
+            server_time = fetch_server_time()
+        except Exception:
+            return
+        last_completed = server_time.replace(
+            minute=0, second=0, microsecond=0
+        ) - timedelta(hours=1)
+
+        if last_completed <= self.last_bar_ts:
+            return
+
+        fetch_start = self.last_bar_ts + timedelta(hours=1)
+        missed_count = int(
+            (last_completed - self.last_bar_ts).total_seconds() / 3600
+        )
+        if missed_count <= 0:
+            return
+
+        self._log_tick(
+            f"Catching up {missed_count} missed bars: "
+            f"{fetch_start} to {last_completed}")
+        if missed_count > 1:
+            emit_alert(CANDIDATE_ID, "WARN",
+                       f"Catching up {missed_count} missed bars after downtime")
+
+        # Fetch all missed bars from Binance
+        import urllib.request
+        start_ms = int(
+            fetch_start.replace(tzinfo=timezone.utc).timestamp() * 1000
+        )
+        end_ms = int(
+            last_completed.replace(tzinfo=timezone.utc).timestamp() * 1000
+        )
+        url = (f"https://fapi.binance.com/fapi/v1/klines"
+               f"?symbol=BTCUSDT&interval=1h&limit=1500"
+               f"&startTime={start_ms}&endTime={end_ms}")
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            emit_alert(CANDIDATE_ID, "WARN", f"Catch-up fetch failed: {e}")
+            return
+
+        for k in data:
+            ts = datetime.fromtimestamp(
+                k[0] / 1000, tz=timezone.utc
+            ).replace(tzinfo=None)
+            if ts <= self.last_bar_ts:
+                continue
+            bar = MarketBar(
+                timestamp=ts, open=float(k[1]), high=float(k[2]),
+                low=float(k[3]), close=float(k[4]), volume=float(k[5]),
+            )
+            self._process_bar(bar)
+
+        self._log_tick(f"Catch-up complete, now at {self.last_bar_ts}")
 
     def _warmup(self) -> None:
         """Fetch last 200 1h bars for RSI buffer initialization."""
