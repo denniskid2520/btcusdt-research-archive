@@ -292,14 +292,21 @@ def place_catastrophe_stop(
         )
 
 
-def cancel_all_orders(api_key: str, api_secret: str) -> None:
+def cancel_all_orders(api_key: str, api_secret: str) -> dict:
+    """Cancel all open orders for BTCUSDT.
+
+    Returns {"ok": True} on success, {"ok": False, "error": str} on failure.
+    Callers must check the result and decide whether to WARN/HALT.
+    Previously this swallowed all exceptions with `except: pass`.
+    """
     try:
         _signed_request(
             "DELETE", "/fapi/v1/allOpenOrders",
             {"symbol": "BTCUSDT"}, api_key, api_secret,
         )
-    except Exception:
-        pass
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 # ── alpha stop (CLIENT-SIDE close-stop, NO exchange order) ──────────
