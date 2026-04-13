@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 
 # --- Config ---
-API_KEY = "b4840b0d41734023a8bc55770a407f06"
+API_KEY = os.environ.get("COINGLASS_API_KEY", "")
 BASE_URL = "https://open-api-v4.coinglass.com"
 
 START_DATE = datetime(2025, 11, 10)  # buffer before channel
