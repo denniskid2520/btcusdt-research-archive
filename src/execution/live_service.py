@@ -369,14 +369,22 @@ class LiveService:
         state = self.runner.state
 
         if replay_only:
-            # During catch-up replay: update state, log events, but
-            # do NOT place live orders. Stale signals must not execute.
+            # ASYMMETRIC REPLAY: entries always skipped, exits execute
+            # if a real live position is open (to close real risk).
             if "ENTRY_FILL" in " ".join(events):
                 self._log_tick(
-                    f"  [REPLAY] entry signal SKIPPED (stale bar)")
+                    "  [REPLAY] entry signal SKIPPED (stale bar)")
             if "TRADE_CLOSE" in " ".join(events):
-                self._log_tick(
-                    f"  [REPLAY] exit signal SKIPPED (stale bar)")
+                if self.has_live_position:
+                    self._log_tick(
+                        "  [REPLAY] exit signal EXECUTING "
+                        "(live position open — must close real risk)")
+                    exit_reason = next(
+                        (e for e in events if "TRADE_CLOSE" in e), "")
+                    self._handle_exit(bar, exit_reason)
+                else:
+                    self._log_tick(
+                        "  [REPLAY] exit signal skipped (no live position)")
         else:
             # Live bar: execute signals normally
             if "ENTRY_FILL" in " ".join(events) and not self.has_live_position:
@@ -778,6 +786,39 @@ class LiveService:
             self._process_bar(bar, replay_only=True)
 
         self._log_tick(f"Catch-up complete, now at {self.last_bar_ts}")
+
+        # Post-catch-up reconciliation: if the runner thinks we're flat
+        # but exchange still has a position, something is wrong.
+        if not self.dry_run and self.api_key:
+            runner_flat = (
+                self.runner.state.position_state != "open"
+                and not self.has_live_position
+            )
+            try:
+                pos = fetch_position(self.api_key, self.api_secret)
+                exchange_has_pos = (
+                    pos is not None
+                    and float(pos.get("positionAmt", 0)) != 0
+                )
+            except Exception as e:
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"Post-catch-up position check failed: {e}")
+                exchange_has_pos = False  # can't verify, proceed cautiously
+
+            if runner_flat and exchange_has_pos:
+                pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
+                emit_alert(CANDIDATE_ID, "CRITICAL",
+                           f"Post-catch-up mismatch: runner is flat but "
+                           f"exchange has position {pos_amt} — HALTING")
+                self.halted = True
+                self.halt_reason = (
+                    f"post_catchup_mismatch: runner flat but "
+                    f"exchange position={pos_amt}"
+                )
+                self.has_live_position = True
+                self.live_quantity = abs(pos_amt)
+                self._save_runner()
+
         return True
 
     def _warmup(self) -> None:

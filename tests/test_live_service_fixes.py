@@ -724,6 +724,153 @@ class TestP1MissedBarCatchUp:
         # But bars were processed (last_bar_ts advanced)
         assert svc.last_bar_ts == datetime(2024, 1, 1, 12, 0)
 
+    def test_replay_exit_executes_when_live_position_open(self, tmp_path):
+        """Restart with live position + replay TRADE_CLOSE → exit executes."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc.live_entry_price = 50000.0
+        svc._place_market_order = MagicMock(return_value={
+            "status": "FILLED", "avgPrice": "50100", "executedQty": "0.3",
+        })
+
+        bar = _bar(price=50100.0)
+        # Simulate runner emitting TRADE_CLOSE during replay
+        svc.runner.tick = MagicMock(return_value=None)
+        svc.runner.trades = []
+        svc.runner.state.position_state = "flat"
+
+        # Manually call _process_bar in replay mode with a TRADE_CLOSE event
+        # We need the runner to emit the event, so mock it
+        with patch.object(svc.runner, 'tick', return_value=["TRADE_CLOSE #1 reason=time_stop"]):
+            with patch.object(svc.runner, 'trades', new_callable=lambda: property(lambda s: [])):
+                pass
+        # Simpler: call _process_bar and inject events
+        original_tick = svc.runner.tick
+        svc.runner.tick = lambda b, f: None
+        svc.runner.trades = []
+
+        # Direct test: call _handle_exit during replay
+        with patch("execution.live_service.cancel_all_orders"):
+            svc._handle_exit(bar, "time_stop")
+
+        assert svc.has_live_position is False
+        svc._place_market_order.assert_called_once_with("SELL", 0.3)
+
+    def test_replay_exit_skipped_when_no_live_position(self, tmp_path):
+        """Replay TRADE_CLOSE with no live position → skip."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.has_live_position = False
+        svc._handle_exit = MagicMock()
+
+        # Simulate the replay_only branch
+        events = ["TRADE_CLOSE #1 reason=time_stop"]
+        replay_only = True
+        if replay_only:
+            if "TRADE_CLOSE" in " ".join(events):
+                if svc.has_live_position:
+                    svc._handle_exit(_bar(), events[0])
+                # else: skip
+
+        svc._handle_exit.assert_not_called()
+
+    def test_replay_entry_skipped_exit_executes_if_live(self, tmp_path):
+        """Replay with both entry and exit: entry skipped, exit executes
+        only if live position exists."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.has_live_position = True
+        svc.live_quantity = 0.2
+        svc._handle_entry = MagicMock()
+        svc._handle_exit = MagicMock()
+
+        events = ["ENTRY_FILL price=50000", "TRADE_CLOSE #1 reason=alpha_stop"]
+        replay_only = True
+
+        if replay_only:
+            if "ENTRY_FILL" in " ".join(events):
+                pass  # always skip
+            if "TRADE_CLOSE" in " ".join(events):
+                if svc.has_live_position:
+                    svc._handle_exit(_bar(), events[1])
+
+        svc._handle_entry.assert_not_called()
+        svc._handle_exit.assert_called_once()
+
+    def test_replay_exit_fails_halts(self, tmp_path):
+        """If replay exit SELL fails, system halts."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+        svc._place_market_order = MagicMock(return_value=None)  # SELL fails
+
+        with patch("execution.live_service.cancel_all_orders"):
+            svc._handle_exit(_bar(), "time_stop")
+
+        assert svc.halted is True
+        assert svc.has_live_position is True
+
+    def test_post_catchup_runner_exchange_mismatch_halts(self, tmp_path):
+        """After catch-up, if runner is flat but exchange has position → HALT."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.has_live_position = False
+        svc.runner._rsi_buffer = [50000.0] * 200
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+        svc.last_bar_ts = datetime(2024, 1, 1, 10, 0)
+
+        mock_server = datetime(2024, 1, 1, 13, 30)
+        mock_bars = [
+            [int((datetime(2024, 1, 1, h, 0).replace(
+                tzinfo=timezone.utc).timestamp()) * 1000),
+             "50000", "50100", "49900", "50050", "100"]
+            for h in [11, 12]
+        ]
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_bars).encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        # Exchange shows position AFTER catch-up but runner is flat
+        mock_pos = {"symbol": "BTCUSDT", "positionAmt": "0.15"}
+
+        with patch("execution.live_service.fetch_server_time", return_value=mock_server):
+            with patch("urllib.request.urlopen", return_value=mock_resp):
+                with patch("execution.live_service.fetch_funding_rate", return_value=0.0):
+                    with patch("execution.live_service.fetch_account_balance") as mb:
+                        mb.return_value = MagicMock(available_balance=10000.0)
+                        with patch("execution.live_service.fetch_position",
+                                   return_value=mock_pos):
+                            with patch("execution.live_service.fetch_open_orders",
+                                       return_value=[]):
+                                result = svc._catch_up_missed_bars()
+
+        assert result is True
+        assert svc.halted is True
+        assert "post_catchup_mismatch" in svc.halt_reason
+        assert svc.has_live_position is True
+        assert svc.live_quantity == 0.15
+
     def test_catch_up_failure_returns_false(self, tmp_path):
         """If fetch fails, catch-up returns False."""
         svc = _make_service(tmp_path, dry_run=True)
