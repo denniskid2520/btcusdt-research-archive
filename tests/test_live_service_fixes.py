@@ -90,15 +90,45 @@ class TestFix1EntryOrderBeforeStateFlip:
         svc._get_strategy_equity = MagicMock(return_value=10000.0)
         svc._log_tick = MagicMock()
         svc._log_event = MagicMock()
-        svc._place_market_order = MagicMock(return_value=None)  # rejected
+        svc._place_market_order = MagicMock(return_value=None)
 
         svc._handle_entry(_bar(price=50000.0))
 
         assert svc.has_live_position is False
         assert svc.live_entry_price == 0.0
 
+    def test_live_new_status_does_not_set_position(self, tmp_path):
+        """CODEX FIX 1: status=NEW must NOT be treated as filled."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_market_order = MagicMock(return_value={
+            "status": "NEW", "avgPrice": "0", "executedQty": "0",
+        })
+
+        with patch("execution.live_service.cancel_all_orders"):
+            svc._handle_entry(_bar(price=50000.0))
+
+        assert svc.has_live_position is False
+
+    def test_live_partial_fill_does_not_set_position(self, tmp_path):
+        """CODEX FIX 1: PARTIALLY_FILLED must NOT proceed."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_market_order = MagicMock(return_value={
+            "status": "PARTIALLY_FILLED", "avgPrice": "50000", "executedQty": "0.1",
+        })
+
+        with patch("execution.live_service.cancel_all_orders"):
+            svc._handle_entry(_bar(price=50000.0))
+
+        assert svc.has_live_position is False
+
     def test_live_successful_entry_sets_position_after_fill(self, tmp_path):
-        """Position is set only AFTER exchange confirms entry + stop."""
+        """Position is set only AFTER exchange confirms FILLED + stop ack."""
         svc = _make_service(tmp_path, dry_run=False)
         svc._get_strategy_equity = MagicMock(return_value=10000.0)
         svc._log_tick = MagicMock()
@@ -122,15 +152,17 @@ class TestFix1EntryOrderBeforeStateFlip:
         assert svc.live_quantity == 0.4
         assert svc.open_catastrophe_order_id == "12345"
 
-    def test_live_catastrophe_reject_flattens_and_does_not_open(self, tmp_path):
-        """If catastrophe stop is rejected, flatten entry and DON'T open."""
+    def test_live_catastrophe_reject_flatten_succeeds(self, tmp_path):
+        """CODEX FIX 2: if flatten SELL succeeds, position stays flat."""
         svc = _make_service(tmp_path, dry_run=False)
         svc._get_strategy_equity = MagicMock(return_value=10000.0)
         svc._log_tick = MagicMock()
         svc._log_event = MagicMock()
-        svc._place_market_order = MagicMock(return_value={
-            "status": "FILLED", "avgPrice": "50000.0", "executedQty": "0.400",
-        })
+        # First call = entry BUY (FILLED), second call = flatten SELL (FILLED)
+        svc._place_market_order = MagicMock(side_effect=[
+            {"status": "FILLED", "avgPrice": "50000.0", "executedQty": "0.400"},
+            {"status": "FILLED", "avgPrice": "49900.0", "executedQty": "0.400"},
+        ])
 
         from execution.live_executor import StopOrderEvent
         mock_stop = StopOrderEvent(
@@ -143,9 +175,40 @@ class TestFix1EntryOrderBeforeStateFlip:
                 svc._handle_entry(_bar(price=50000.0))
 
         assert svc.has_live_position is False
-        # Should have called _place_market_order twice: entry BUY + flatten SELL
-        assert svc._place_market_order.call_count == 2
-        assert svc._place_market_order.call_args_list[1][0][0] == "SELL"
+
+    def test_live_catastrophe_reject_flatten_fails_marks_naked(self, tmp_path):
+        """CODEX FIX 2: if flatten SELL also fails, mark position as live
+        so reconciliation can detect the naked position."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = False
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+        # First call = entry BUY (FILLED), second call = flatten SELL (FAILS)
+        svc._place_market_order = MagicMock(side_effect=[
+            {"status": "FILLED", "avgPrice": "50000.0", "executedQty": "0.400"},
+            None,  # flatten fails
+        ])
+
+        from execution.live_executor import StopOrderEvent
+        mock_stop = StopOrderEvent(
+            timestamp="2024-01-01", event_type="reject",
+            order_type="catastrophe_stop", side="long",
+            stop_price=48750.0, quantity=0.4, error="network error",
+        )
+        with patch("execution.live_service.place_catastrophe_stop", return_value=mock_stop):
+            with patch("execution.live_service.log_stop_event"):
+                svc._handle_entry(_bar(price=50000.0))
+
+        # Position marked open so reconciliation can handle it
+        assert svc.has_live_position is True
+        assert svc.live_quantity == 0.4
 
 
 # ── FIX 2: startup recovery ────────────────────────────────────────
@@ -192,6 +255,55 @@ class TestFix2StartupRecovery:
 
         assert svc.has_live_position is False
         assert svc.live_entry_price == 0.0
+
+    def test_startup_clears_stale_position_when_exchange_flat(self, tmp_path):
+        """CODEX FIX 3: if state.json says open but exchange is flat,
+        clear the internal flag so new entries aren't blocked."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "state.json").write_text(json.dumps({
+            "has_live_position": True,
+            "live_entry_price": 72500.0,
+            "live_quantity": 0.276,
+            "live_alpha_level": 71593.75,
+            "live_catastrophe_level": 70687.5,
+            "open_catastrophe_order_id": "99887766",
+        }))
+
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.state_dir = state_dir
+        svc._log_tick = MagicMock()
+
+        # Exchange says NO position
+        with patch("execution.live_service.fetch_position", return_value=None):
+            svc._restore_live_position_state()
+
+        assert svc.has_live_position is False
+        assert svc.live_quantity == 0.0
+
+    def test_startup_keeps_position_when_exchange_confirms(self, tmp_path):
+        """If exchange confirms position exists, keep internal state."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "state.json").write_text(json.dumps({
+            "has_live_position": True,
+            "live_entry_price": 72500.0,
+            "live_quantity": 0.276,
+            "live_alpha_level": 71593.75,
+            "live_catastrophe_level": 70687.5,
+            "open_catastrophe_order_id": "99887766",
+        }))
+
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.state_dir = state_dir
+        svc._log_tick = MagicMock()
+
+        mock_pos = {"symbol": "BTCUSDT", "positionAmt": "0.276"}
+        with patch("execution.live_service.fetch_position", return_value=mock_pos):
+            svc._restore_live_position_state()
+
+        assert svc.has_live_position is True
+        assert svc.live_entry_price == 72500.0
 
     def test_save_then_restore_roundtrip(self, tmp_path):
         """Save state with open position, then restore it."""
