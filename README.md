@@ -1,4 +1,12 @@
-# BTCUSDT D1 Perpetual Futures Strategy
+# BTCUSDT Research Archive
+
+> **Production system has moved to [btcusdt-perp-live](https://github.com/denniskid2520/btcusdt-perp-live)**
+
+This repository contains the full research history: 18 phases, 6,427 parameter sweeps, legacy strategies, phase reports, and experimental materials. For the active live trading system, see the production repo above.
+
+---
+
+# BTCUSDT D1 Perpetual Futures Strategy (Archive)
 
 Quantitative BTCUSDT perpetual futures trading system. Live on Binance USDT-M.
 
